@@ -1,0 +1,55 @@
+
+name = "fixly-backend"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+# ===== D1 DATABASE =====
+[[d1_databases]]
+binding = "DB"
+database_name = "fixly-taller-db"
+database_id = "1fd37abb-5843-4d5a-8528-182d7c90729f"
+
+# ===== KV NAMESPACES =====
+[[kv_namespaces]]
+binding = "CODES"
+id = "680bf30bb8a942a0b318ea47d560d771"
+
+[[kv_namespaces]]
+binding = "FIXLY_CODES"
+id = "2bed8a1568814fb6960076335c9eeeeb"
+
+[[kv_namespaces]]
+binding = "FIXLY_CUSTOMERS"
+id = "401e396196fb4f8dabd7ca2208bc43da"
+
+[[kv_namespaces]]
+binding = "FIXLY_HISTORY"
+id = "f134fde4fed04bafb476170c848a4df0"
+
+[[kv_namespaces]]
+binding = "FIXLY_KV"
+id = "f3ac4b82a2ee435caffc38da00f1cfce"
+
+[[kv_namespaces]]
+binding = "FIXLY_REPAIRS"
+id = "ab6df804a9b14f578ec4b3ccf9a040d1"
+
+[[kv_namespaces]]
+binding = "FIXLY_SUBSCRIPTIONS"
+id = "4f7e09723cad4c83a45ad1475ede0a17"
+
+[[kv_namespaces]]
+binding = "FIXLY_USERS"
+id = "720cf073dec94897a55be575b97e1d2f"
+
+[[kv_namespaces]]
+binding = "SUBSCRIPTIONS"
+id = "c736e0ee9d04439b86282b3c2b69808e"
+
+[[kv_namespaces]]
+binding = "TENANTS"
+id = "35d238c0fa4844cb94e48ae5b2a90409"
+
+[[kv_namespaces]]
+binding = "USERS"
+id = "2cfb9502f11849419f17210d01c2ebad"
