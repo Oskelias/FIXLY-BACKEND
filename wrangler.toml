@@ -1,7 +1,11 @@
-
 name = "fixly-backend"
-main = "index.js"
-compatibility_date = "2024-01-01"
+main = "src/index.js"
+compatibility_date = "2025-09-20"
+
+# (Opcional) Si querés que quede todo declarativo acá:
+# routes = [
+#   { pattern = "api.fixlytaller.com/*", zone_name = "fixlytaller.com" }
+# ]
 
 # ===== D1 DATABASE =====
 [[d1_databases]]
