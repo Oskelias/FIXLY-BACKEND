@@ -1,5 +1,5 @@
-// GET/POST /api/app/reparaciones - Repairs management
-import { json, authenticateRequest, generateOrderNumber, getLocationId } from "../../_lib.js";
+// GET/POST /api/clientes - Clients management (tenant + location scoped)
+import { json, authenticateRequest, getLocationId } from "../_lib.js";
 
 export async function onRequestGet(context) {
   const { request, env } = context;
@@ -13,10 +13,10 @@ export async function onRequestGet(context) {
     }
 
     const r = await env.DB.prepare(
-      `SELECT * FROM reparaciones WHERE tenant_id = ? AND location_id = ? ORDER BY created_at DESC`
+      `SELECT * FROM clientes WHERE tenant_id = ? AND location_id = ? ORDER BY nombre ASC`
     ).bind(tenantId, locationId).all();
 
-    return json({ success: true, reparaciones: r.results });
+    return json({ success: true, clientes: r.results });
   } catch (err) {
     return json({ success: false, error: err.message }, 401);
   }
@@ -34,33 +34,23 @@ export async function onRequestPost(context) {
       return json({ success: false, error: "Location ID is required" }, 400);
     }
 
-    if (!data.cliente || !data.equipo) {
-      return json({ success: false, error: "Cliente and equipo are required" }, 400);
+    if (!data.nombre) {
+      return json({ success: false, error: "Nombre is required" }, 400);
     }
 
-    const ordenId = await generateOrderNumber(tenantId, locationId, env.DB);
-
     const res = await env.DB.prepare(`
-      INSERT INTO reparaciones (
-        tenant_id, location_id, orden_id, cliente, telefono, equipo, problema,
-        estado, tecnico, costo, anticipo, observaciones, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      INSERT INTO clientes (tenant_id, location_id, nombre, telefono, email, direccion, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
     `).bind(
       tenantId,
       locationId,
-      ordenId,
-      data.cliente,
+      data.nombre,
       data.telefono || "",
-      data.equipo,
-      data.problema || "",
-      data.estado || "recibido",
-      data.tecnico || "",
-      data.costo || 0,
-      data.anticipo || 0,
-      data.observaciones || ""
+      data.email || "",
+      data.direccion || ""
     ).run();
 
-    return json({ success: true, id: res.meta.last_row_id, ordenId });
+    return json({ success: true, id: res.meta.last_row_id });
   } catch (err) {
     return json({ success: false, error: err.message }, 401);
   }
