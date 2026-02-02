@@ -1,5 +1,5 @@
 // GET /api/app/dashboard - App dashboard stats
-import { json, authenticateRequest } from "../../_lib.js";
+import { json, authenticateRequest, getLocationId } from "../../_lib.js";
 
 export async function onRequestGet(context) {
   const { request, env } = context;
@@ -7,12 +7,20 @@ export async function onRequestGet(context) {
   try {
     const user = await authenticateRequest(request, env);
     const tenantId = user.tenantId;
+    const locationId = getLocationId(request);
+    if (!locationId) {
+      return json({ success: false, error: "Location ID is required" }, 400);
+    }
 
     const stats = await env.DB.batch([
-      env.DB.prepare(`SELECT COUNT(*) as count FROM reparaciones WHERE tenant_id = ?`).bind(tenantId),
-      env.DB.prepare(`SELECT COUNT(*) as count FROM reparaciones WHERE tenant_id = ? AND estado = ?`).bind(tenantId, "diagnosticando"),
-      env.DB.prepare(`SELECT COUNT(*) as count FROM reparaciones WHERE tenant_id = ? AND estado = ?`).bind(tenantId, "listo"),
-      env.DB.prepare(`SELECT COUNT(*) as count FROM clientes WHERE tenant_id = ?`).bind(tenantId)
+      env.DB.prepare(`SELECT COUNT(*) as count FROM reparaciones WHERE tenant_id = ? AND location_id = ?`)
+        .bind(tenantId, locationId),
+      env.DB.prepare(`SELECT COUNT(*) as count FROM reparaciones WHERE tenant_id = ? AND location_id = ? AND estado = ?`)
+        .bind(tenantId, locationId, "diagnosticando"),
+      env.DB.prepare(`SELECT COUNT(*) as count FROM reparaciones WHERE tenant_id = ? AND location_id = ? AND estado = ?`)
+        .bind(tenantId, locationId, "listo"),
+      env.DB.prepare(`SELECT COUNT(*) as count FROM clientes WHERE tenant_id = ? AND location_id = ?`)
+        .bind(tenantId, locationId)
     ]);
 
     return json({

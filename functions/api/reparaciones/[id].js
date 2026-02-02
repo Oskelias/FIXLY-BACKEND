@@ -1,4 +1,4 @@
-// GET/PUT/DELETE /api/historial/:id - History entry detail (tenant + location scoped)
+// GET/PUT/DELETE /api/reparaciones/:id - Repair detail (tenant + location scoped)
 import { json, authenticateRequest, getLocationId } from "../../_lib.js";
 
 export async function onRequestGet(context) {
@@ -13,15 +13,15 @@ export async function onRequestGet(context) {
       return json({ success: false, error: "Location ID is required" }, 400);
     }
 
-    const entry = await env.DB.prepare(
-      `SELECT * FROM historial WHERE id = ? AND tenant_id = ? AND location_id = ?`
+    const reparacion = await env.DB.prepare(
+      `SELECT * FROM reparaciones WHERE id = ? AND tenant_id = ? AND location_id = ?`
     ).bind(id, tenantId, locationId).first();
 
-    if (!entry) {
-      return json({ success: false, error: "Historial not found" }, 404);
+    if (!reparacion) {
+      return json({ success: false, error: "Reparacion not found" }, 404);
     }
 
-    return json({ success: true, historial: entry });
+    return json({ success: true, reparacion });
   } catch (err) {
     return json({ success: false, error: err.message }, 401);
   }
@@ -43,7 +43,17 @@ export async function onRequestPut(context) {
     const fields = [];
     const vals = [];
 
-    for (const k of ["referencia_tipo", "referencia_id", "descripcion"]) {
+    for (const k of [
+      "cliente",
+      "telefono",
+      "equipo",
+      "problema",
+      "estado",
+      "tecnico",
+      "costo",
+      "anticipo",
+      "observaciones"
+    ]) {
       if (updates[k] !== undefined) {
         fields.push(`${k} = ?`);
         vals.push(updates[k]);
@@ -54,10 +64,11 @@ export async function onRequestPut(context) {
       return json({ success: false, error: "No valid fields to update" }, 400);
     }
 
+    fields.push(`updated_at = datetime("now")`);
     vals.push(id, tenantId, locationId);
 
     await env.DB.prepare(
-      `UPDATE historial SET ${fields.join(", ")} WHERE id = ? AND tenant_id = ? AND location_id = ?`
+      `UPDATE reparaciones SET ${fields.join(", ")} WHERE id = ? AND tenant_id = ? AND location_id = ?`
     ).bind(...vals).run();
 
     return json({ success: true });
@@ -79,7 +90,7 @@ export async function onRequestDelete(context) {
     }
 
     await env.DB.prepare(
-      `DELETE FROM historial WHERE id = ? AND tenant_id = ? AND location_id = ?`
+      `DELETE FROM reparaciones WHERE id = ? AND tenant_id = ? AND location_id = ?`
     ).bind(id, tenantId, locationId).run();
 
     return json({ success: true });

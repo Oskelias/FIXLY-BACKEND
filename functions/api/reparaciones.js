@@ -1,5 +1,5 @@
-// GET/POST /api/app/reparaciones - Repairs management
-import { json, authenticateRequest, generateOrderNumber, getLocationId } from "../../_lib.js";
+// GET/POST /api/reparaciones - Repairs management (tenant + location scoped)
+import { json, authenticateRequest, generateOrderNumber, getLocationId } from "../_lib.js";
 
 export async function onRequestGet(context) {
   const { request, env } = context;
@@ -13,7 +13,9 @@ export async function onRequestGet(context) {
     }
 
     const r = await env.DB.prepare(
-      `SELECT * FROM reparaciones WHERE tenant_id = ? AND location_id = ? ORDER BY created_at DESC`
+      `SELECT * FROM reparaciones
+       WHERE tenant_id = ? AND location_id = ?
+       ORDER BY created_at DESC`
     ).bind(tenantId, locationId).all();
 
     return json({ success: true, reparaciones: r.results });

@@ -108,6 +108,18 @@ export async function authenticateRequest(request, env, requireAdmin = false) {
   return payload;
 }
 
+export function getLocationId(request, data = {}) {
+  const url = new URL(request.url);
+  return (
+    request.headers.get("X-Location-Id") ||
+    url.searchParams.get("locationId") ||
+    url.searchParams.get("location_id") ||
+    data.locationId ||
+    data.location_id ||
+    ""
+  );
+}
+
 export async function manageDeviceSessions(user, env, token, deviceId, meta = {}) {
   const tokenHash = await sha256Hex(token);
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
@@ -138,8 +150,10 @@ export async function manageDeviceSessions(user, env, token, deviceId, meta = {}
   ).run();
 }
 
-export async function generateOrderNumber(tenantId, db) {
-  const r = await db.prepare(`SELECT COUNT(*) as count FROM reparaciones WHERE tenant_id = ?`).bind(tenantId).first();
+export async function generateOrderNumber(tenantId, locationId, db) {
+  const r = await db.prepare(`
+    SELECT COUNT(*) as count FROM reparaciones WHERE tenant_id = ? AND location_id = ?
+  `).bind(tenantId, locationId).first();
   const next = (r?.count || 0) + 1;
   return `ORD-${String(next).padStart(4, "0")}`;
 }
