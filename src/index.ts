@@ -5,12 +5,14 @@ type Env = {
   AUTH_SECRET?: string;
   JWT_SECRET?: string;
   QUEUE_SECRET?: string;
+  ADMIN_BOOTSTRAP_EMAIL?: string;
   ADMIN_DOMAIN?: string;
   APP_DOMAIN?: string;
   CORS_ALLOWED?: string;
 };
 
 const DEFAULT_ALLOWED_ORIGINS = [
+  "https://admin.fixlytaller.com",
   "https://app.fixlytaller.com",
   "https://fixlytaller.com"
 ];
@@ -422,7 +424,46 @@ async function fetchTenantById(
   };
 }
 
-async function getAuthContext(request: Request, env: Env): Promise<{ userId: string; tenantId: string; plan?: string }> {
+async function fetchUserById(env: Env, userId: string, columns: string[]): Promise<{
+  id: string;
+  tenant_id: string;
+  name?: string;
+  email?: string;
+  role?: string;
+  status?: string | number | null;
+  active?: string | number | null;
+} | null> {
+  const nameColumn = getUserNameColumn(columns);
+  const fields = [
+    "id",
+    "tenant_id",
+    `${nameColumn} as name`,
+    "email",
+    "role"
+  ];
+  if (columns.includes("status")) fields.push("status");
+  if (columns.includes("active")) fields.push("active");
+  const query = `SELECT ${fields.join(", ")} FROM users WHERE id = ? LIMIT 1`;
+  const user = await env.DB.prepare(query).bind(userId).first();
+  if (!user) return null;
+  return {
+    id: String(user.id),
+    tenant_id: String(user.tenant_id),
+    name: user.name ? String(user.name) : undefined,
+    email: user.email ? String(user.email) : undefined,
+    role: user.role ? String(user.role) : undefined,
+    status: user.status ?? null,
+    active: user.active ?? null
+  };
+}
+
+async function getAuthContext(request: Request, env: Env): Promise<{
+  userId: string;
+  tenantId: string;
+  plan?: string;
+  role?: string;
+  email?: string;
+}> {
   const auth = request.headers.get("Authorization") || "";
   if (!auth.startsWith("Bearer ")) {
     throw new Error("unauthorized");
@@ -436,7 +477,23 @@ async function getAuthContext(request: Request, env: Env): Promise<{ userId: str
   }
   const { tenants } = await ensureSchema(env);
   const tenant = await fetchTenantById(env, tenantId, tenants);
-  return { userId, tenantId, plan: tenant?.plan || "free" };
+  const { users } = await ensureSchema(env);
+  const user = await fetchUserById(env, userId, users);
+  return {
+    userId,
+    tenantId,
+    plan: tenant?.plan || "free",
+    role: user?.role,
+    email: user?.email
+  };
+}
+
+function isAdminUser(role?: string, email?: string | null, env?: Env): boolean {
+  if (role === "admin" || role === "superadmin") return true;
+  if (email && env?.ADMIN_BOOTSTRAP_EMAIL) {
+    return email.toLowerCase() === env.ADMIN_BOOTSTRAP_EMAIL.toLowerCase();
+  }
+  return false;
 }
 
 async function getWhatsappSettings(env: Env, tenantId: string): Promise<{
@@ -551,6 +608,22 @@ async function logAudit(env: Env, params: { tenantId?: string | null; type: stri
       nowISO()
     )
     .run();
+}
+
+async function getTableColumns(env: Env, table: string): Promise<string[]> {
+  const info = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
+  return (info.results || []).map((row) => String(row.name));
+}
+
+function isUserActive(row: { status?: string | number | null; active?: string | number | null }): boolean {
+  if (row.active !== undefined && row.active !== null) {
+    if (typeof row.active === "number") return row.active === 1;
+    return String(row.active).toLowerCase() === "true" || String(row.active) === "1";
+  }
+  if (row.status !== undefined && row.status !== null) {
+    return String(row.status).toLowerCase() === "active";
+  }
+  return true;
 }
 
 export default {
@@ -759,14 +832,14 @@ export default {
             token,
             user: {
               id: userId,
-              email: email || "",
-              name: ownerNombre || "",
+              email,
+              name: ownerNombre,
               role: "owner"
             },
             tenant: {
-              id: tenantId || "",
-              name: tallerNombre || "",
-              slug: tenantSlug || "",
+              id: tenantId,
+              name: tallerNombre,
+              slug: tenantSlug,
               plan: "free"
             }
           },
@@ -1007,6 +1080,97 @@ export default {
       }
     }
 
+    if (path === "/admin/stats" && method === "GET") {
+      try {
+        const authContext = await getAuthContext(request, env);
+        if (!isAdminUser(authContext.role, authContext.email, env)) {
+          return jsonResponse({ ok: false, error: "forbidden" }, 403, corsHeaders(request, env));
+        }
+        const tenantsCount = await env.DB.prepare("SELECT COUNT(*) as count FROM tenants").first();
+        const usersCount = await env.DB.prepare("SELECT COUNT(*) as count FROM users").first();
+        let usersActive = Number(usersCount?.count || 0);
+        const userColumns = await getTableColumns(env, "users");
+        if (userColumns.includes("status") || userColumns.includes("active")) {
+          const rows = await env.DB.prepare("SELECT status, active FROM users").all();
+          usersActive = (rows.results || []).filter((row) =>
+            isUserActive({
+              status: row.status ?? null,
+              active: row.active ?? null
+            })
+          ).length;
+        }
+
+        let paymentsMonth = 0;
+        let revenueMonth = 0;
+        const paymentColumns = await getTableColumns(env, "pagos");
+        if (paymentColumns.length > 0) {
+          // TODO: refine payment metrics once the payments schema is finalized.
+          const startOfMonth = new Date();
+          startOfMonth.setUTCDate(1);
+          startOfMonth.setUTCHours(0, 0, 0, 0);
+          const since = startOfMonth.toISOString();
+          const paymentRows = await env.DB.prepare(
+            "SELECT COUNT(*) as count FROM pagos WHERE created_at >= ?1"
+          )
+            .bind(since)
+            .first();
+          paymentsMonth = Number(paymentRows?.count || 0);
+          revenueMonth = 0;
+        }
+
+        return jsonResponse(
+          {
+            ok: true,
+            stats: {
+              tenants_total: Number(tenantsCount?.count || 0),
+              users_total: Number(usersCount?.count || 0),
+              users_active: usersActive,
+              payments_month: paymentsMonth,
+              revenue_month: revenueMonth
+            }
+          },
+          200,
+          corsHeaders(request, env)
+        );
+      } catch {
+        return jsonResponse({ ok: false, error: "unauthorized" }, 401, corsHeaders(request, env));
+      }
+    }
+
+    if (path === "/admin/tenants" && method === "GET") {
+      try {
+        const authContext = await getAuthContext(request, env);
+        if (!isAdminUser(authContext.role, authContext.email, env)) {
+          return jsonResponse({ ok: false, error: "forbidden" }, 403, corsHeaders(request, env));
+        }
+        const tenantColumns = await getTableColumns(env, "tenants");
+        const nameColumn = getTenantNameColumn(tenantColumns);
+        const slugColumn = getTenantSlugColumn(tenantColumns);
+        const planColumn = getTenantPlanColumn(tenantColumns);
+        const createdColumn = getTenantCreatedColumn(tenantColumns);
+        const fields = [
+          "id",
+          `${nameColumn} as name`
+        ];
+        if (slugColumn) fields.push(`${slugColumn} as slug`);
+        if (planColumn) fields.push(`${planColumn} as plan`);
+        if (createdColumn) fields.push(`${createdColumn} as created_at`);
+        const rows = await env.DB.prepare(
+          `SELECT ${fields.join(", ")} FROM tenants ORDER BY ${createdColumn || "rowid"} DESC LIMIT 200`
+        ).all();
+        const tenants = (rows.results || []).map((row) => ({
+          id: String(row.id),
+          name: row.name ? String(row.name) : "",
+          slug: row.slug ? String(row.slug) : "",
+          plan: row.plan ? String(row.plan) : "free",
+          created_at: row.created_at ? String(row.created_at) : null
+        }));
+        return jsonResponse({ ok: true, tenants }, 200, corsHeaders(request, env));
+      } catch {
+        return jsonResponse({ ok: false, error: "unauthorized" }, 401, corsHeaders(request, env));
+      }
+    }
+
     if (path === "/auth/public/login" && method === "POST") {
       try {
         const payload = await readJson(request);
@@ -1058,12 +1222,12 @@ export default {
             token,
             user: {
               id: user.id,
-              email: user.email || "",
-              name: user.name || "",
+              email: user.email,
+              name: user.name,
               role: user.role || "owner"
             },
             tenant: {
-              id: tenant?.id || user.tenant_id || "",
+              id: tenant?.id || user.tenant_id,
               name: tenant?.name || "",
               slug: tenant?.slug || "",
               plan: tenant?.plan || "free"
@@ -1113,12 +1277,12 @@ export default {
             ok: true,
             user: {
               id: user.id,
-              email: user.email || "",
-              name: user.name || "",
+              email: user.email,
+              name: user.name,
               role: user.role || "owner"
             },
             tenant: {
-              id: tenant?.id || tenantId || "",
+              id: tenant?.id || tenantId,
               name: tenant?.name || "",
               slug: tenant?.slug || "",
               plan,

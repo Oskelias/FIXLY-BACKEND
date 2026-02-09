@@ -68,6 +68,7 @@ id = "2cfb9502f11849419f17210d01c2ebad"
 # - MP_WEBHOOK_SECRET (Mercado Pago)
 #
 # Optional vars:
+# - ADMIN_BOOTSTRAP_EMAIL (admin bootstrap email for console access)
 # - ADMIN_DOMAIN (e.g., https://admin.fixlytaller.com)
 # - APP_DOMAIN (e.g., https://app.fixlytaller.com)
 # - CORS_ALLOWED (comma-separated list of allowed origins)
