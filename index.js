@@ -1,4 +1,3 @@
-
 // ==== FIX-CORS HELPERS (non-invasive) ====
 function __fix_allowedOrigins(env) {
   const set = new Set();
@@ -714,13 +713,6 @@ function healthPayload() {
   };
 }
 __name(healthPayload, "healthPayload");
-var worker_default = {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const rawPath = decodeURIComponent(url.pathname);
-const path = rawPath.trim().replace(/\/+$/, '');
-    const method = request.method;
-    
 
 async function handleMPWebhook(request, env) {
   const signature = request.headers.get("x-signature");
@@ -748,14 +740,23 @@ async function handleMPWebhook(request, env) {
 
   return json({ ok:true, ignored:true });
 }
-if (method === "OPTIONS") {
+
+var worker_default = {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const rawPath = decodeURIComponent(url.pathname);
+    const path = rawPath.trim().replace(/\/+$/, '');
+    const method = request.method;
+    
+    if (method === "OPTIONS") {
       return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", ...DEFAULT_CORS } });
+    }
+    
     // Webhook Mercado Pago (server-to-server)
     if (path === "/webhooks/mercadopago" && method === "POST") {
       return await handleMPWebhook(request, env);
     }
 
-    }
     if (path === "/test-telegram" && method === "GET") return __fix_withCORS(await handleTestTelegram(request), request, env);
     if (path === "/api/lead-registro" && method === "POST") return __fix_withCORS(await handleLeadRegistro(request, env), request, env);
     if (path === "/telegram/callback" && method === "POST") {
@@ -799,169 +800,163 @@ if (method === "OPTIONS") {
     if (path === "/health" && method === "GET") {
       return json(healthPayload(), 200, corsHeadersFor(request, env));
     }
-    if (path === "/api/auth/login" && method === "POST")
-  return __fix_withCORS(await handleLogin(request, env), request, env);
-
-// Alias canónico
-if (path === "/auth/public/login" && method === "POST")
-  return __fix_withCORS(await handleLogin(request, env), request, env);
-
-// Alias adicional usado por el front
-if (path === "/auth/login" && method === "POST")
+    
+    // Auth endpoints - limpios sin duplicados
     if (path === "/api/auth/login" && method === "POST") return __fix_withCORS(await handleLogin(request, env), request, env);
-
-  return __fix_withCORS(await handleLogin(request, env), request, env); return __fix_withCORS(await handleLogin(request, env), request, env);
+    if (path === "/auth/login" && method === "POST") return __fix_withCORS(await handleLogin(request, env), request, env);
     if (path === "/api/auth/logout" && method === "POST") return __fix_withCORS(await handleLogout(request, env), request, env);
+    
     // === Adapter para consola: /admin/users (GET/POST) ===
-if (path === "/admin/users") {
-  const cors = corsHeadersFor(request, env);
+    if (path === "/admin/users") {
+      const cors = corsHeadersFor(request, env);
 
-  // ---- GET: normaliza a { success: true, data: { users: [...] } }
-  if (method === "GET") {
-    const req2 = new Request(new URL("/api/admin/users", request.url), {
-      method:"GET",
-      headers: request.headers
-    });
-    const upstream = await handleAdminRoutes(req2, env, "/api/admin/users", "GET", cors);
+      // ---- GET: normaliza a { success: true, data: { users: [...] } }
+      if (method === "GET") {
+        const req2 = new Request(new URL("/api/admin/users", request.url), {
+          method:"GET",
+          headers: request.headers
+        });
+        const upstream = await handleAdminRoutes(req2, env, "/api/admin/users", "GET", cors);
 
-    let data = {};
-    try { const raw = await upstream.text(); data = raw ? JSON.parse(raw) : {}; } catch {}
+        let data = {};
+        try { const raw = await upstream.text(); data = raw ? JSON.parse(raw) : {}; } catch {}
 
-    const rows = Array.isArray(data.users) ? data.users
-               : (Array.isArray(data.items) ? data.items : []);
+        const rows = Array.isArray(data.users) ? data.users
+                   : (Array.isArray(data.items) ? data.items : []);
 
-    const users = rows.map(u => ({
-      id: u.id ?? u.user_id ?? null,
-      email: u.email ?? "",
-      name: u.name ?? u.username ?? "",
-      role: (typeof u.role === "string")
-              ? (u.role.toLowerCase() === "admin"  ? "Administrador"
-                : u.role.toLowerCase() === "viewer" ? "Visualizador"
-                : "Operador")
-              : "Operador",
-      active: (u.active !== undefined) ? !!u.active
-            : (u.status ? String(u.status).toLowerCase() === "active" : true),
-      lastAccess: u.last_login ?? u.updated_at ?? null
-    }));
+        const users = rows.map(u => ({
+          id: u.id ?? u.user_id ?? null,
+          email: u.email ?? "",
+          name: u.name ?? u.username ?? "",
+          role: (typeof u.role === "string")
+                  ? (u.role.toLowerCase() === "admin"  ? "Administrador"
+                    : u.role.toLowerCase() === "viewer" ? "Visualizador"
+                    : "Operador")
+                  : "Operador",
+          active: (u.active !== undefined) ? !!u.active
+                : (u.status ? String(u.status).toLowerCase() === "active" : true),
+          lastAccess: u.last_login ?? u.updated_at ?? null
+        }));
 
-    return __fix_withCORS(json({ success: true, data: { users } }, 200, cors), request, env);
-  }
-
-  // ---- POST: crear usuario (con fallback directo a D1) ----
-  if (method === "POST") {
-    // Acepta JSON, FormData o x-www-form-urlencoded
-    async function readPayload(req){
-      try { const j = await req.clone().json(); if (j && (j.email || j.userEmail || j.password || j.userPassword)) return j; } catch {}
-      try {
-        const fd = await req.clone().formData();
-        const obj = {}; for (const [k,v] of fd.entries()) obj[k] = typeof v === "string" ? v : "";
-        if (obj.email || obj.userEmail || obj.password || obj.userPassword) return obj;
-      } catch {}
-      try {
-        const txt = await req.clone().text();
-        const obj = {}; new URLSearchParams(txt).forEach((v,k)=> obj[k]=v);
-        if (obj.email || obj.userEmail || obj.password || obj.userPassword) return obj;
-      } catch {}
-      return {};
-    }
-
-    function toBool(v){
-      if (typeof v === "boolean") return v;
-      if (v == null) return false;
-      const s = String(v).toLowerCase();
-      return s === "true" || s === "1" || s === "on" || s === "yes";
-    }
-
-    const body = await readPayload(request);
-    const email = (body.email || body.userEmail || body.mail || "").trim();
-    const name  = (body.name  || body.userName || body.fullname || body.fullName || "").trim();
-    const pass  = (body.password || body.userPassword || body.pass || "").toString();
-    const roleUi  = (body.role || body.userRole || "").toString(); // "Administrador" | "Operador" | "Visualizador"
-    const active = ('active' in body) ? toBool(body.active)
-                   : ('userActive' in body) ? toBool(body.userActive) : true;
-
-    if (!email || !pass) {
-      return __fix_withCORS(json({ success:false, message:"email y password requeridos" }, 400, cors), request, env);
-    }
-
-    // 1) Intento normal contra tu API interna
-    try {
-      const base = (email.split("@")[0] || "user").replace(/[^a-z0-9._-]/gi,"").toLowerCase() || "user";
-      const suf  = Math.random().toString(36).slice(2,7);
-      const username = `${base}-${suf}`;
-
-      const hdrs = new Headers(request.headers);
-      hdrs.set("content-type","application/json");
-
-      const payload = {
-        username,
-        password: pass,
-        email,
-        role: roleUi,
-        plan: "basic",
-        status: active ? "active" : "paused",
-        name,
-        active
-      };
-
-      const req2 = new Request(new URL("/api/admin/users", request.url), {
-        method: "POST",
-        headers: hdrs,
-        body: JSON.stringify(payload)
-      });
-      const upstream = await handleAdminRoutes(req2, env, "/api/admin/users", "POST", cors);
-
-      if (upstream.status >= 200 && upstream.status < 300) {
-        const data = await (async ()=>{ try{ const t=await upstream.text(); return t?JSON.parse(t):{}; }catch{ return {}; } })();
-        return __fix_withCORS(json({ success:true, ...data }, 201, cors), request, env);
-      }
-    } catch (_) { /* seguimos al fallback */ }
-
-    // 2) Fallback directo a D1
-    try {
-      // email duplicado
-      const dup = await env.DB.prepare(`SELECT id FROM users WHERE email = ?`).bind(email).first();
-      if (dup) return __fix_withCORS(json({ success:false, message:"El email ya está en uso" }, 409, cors), request, env);
-
-      // username único
-      function baseFromEmail(e){ return (e.split("@")[0] || "user").replace(/[^a-z0-9._-]/gi,"").toLowerCase() || "user"; }
-      const base = baseFromEmail(email);
-      let username = `${base}-${Math.random().toString(36).slice(2,7)}`;
-      for (let i=0; i<8; i++){
-        const ex = await env.DB.prepare(`SELECT id FROM users WHERE username = ?`).bind(username).first();
-        if (!ex) break;
-        username = `${base}-${Math.random().toString(36).slice(2,7)}`;
+        return __fix_withCORS(json({ success: true, data: { users } }, 200, cors), request, env);
       }
 
-      // normalizar rol
-      const roleNorm = (()=> {
-        const r = roleUi.toString().toLowerCase();
-        if (["administrador","admin","owner"].includes(r)) return "admin";
-        if (["visualizador","viewer"].includes(r)) return "viewer";
-        return "user"; // Operador
-      })();
+      // ---- POST: crear usuario (con fallback directo a D1) ----
+      if (method === "POST") {
+        // Acepta JSON, FormData o x-www-form-urlencoded
+        async function readPayload(req){
+          try { const j = await req.clone().json(); if (j && (j.email || j.userEmail || j.password || j.userPassword)) return j; } catch {}
+          try {
+            const fd = await req.clone().formData();
+            const obj = {}; for (const [k,v] of fd.entries()) obj[k] = typeof v === "string" ? v : "";
+            if (obj.email || obj.userEmail || obj.password || obj.userPassword) return obj;
+          } catch {}
+          try {
+            const txt = await req.clone().text();
+            const obj = {}; new URLSearchParams(txt).forEach((v,k)=> obj[k]=v);
+            if (obj.email || obj.userEmail || obj.password || obj.userPassword) return obj;
+          } catch {}
+          return {};
+        }
 
-      // hash, tenant, trial
-      const hashed = await hashPassword(pass);
-      const tenantId = crypto.randomUUID();
-      const trialEndsAt = new Date(Date.now() + 7*24*60*60*1000).toISOString();
+        function toBool(v){
+          if (typeof v === "boolean") return v;
+          if (v == null) return false;
+          const s = String(v).toLowerCase();
+          return s === "true" || s === "1" || s === "on" || s === "yes";
+        }
 
-      // insert
-      const res = await env.DB.prepare(`
-        INSERT INTO users (username, password, email, tenant_id, role, plan, status, trial_ends_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      `).bind(username, hashed, email, tenantId, roleNorm, "basic", active ? "active" : "paused", trialEndsAt).run();
+        const body = await readPayload(request);
+        const email = (body.email || body.userEmail || body.mail || "").trim();
+        const name  = (body.name  || body.userName || body.fullname || body.fullName || "").trim();
+        const pass  = (body.password || body.userPassword || body.pass || "").toString();
+        const roleUi  = (body.role || body.userRole || "").toString(); // "Administrador" | "Operador" | "Visualizador"
+        const active = ('active' in body) ? toBool(body.active)
+                       : ('userActive' in body) ? toBool(body.userActive) : true;
 
-      return __fix_withCORS(json({ success:true, userId: res.meta.last_row_id, tenantId }, 201, cors), request, env);
-    } catch (e) {
-      return __fix_withCORS(json({ success:false, message:`Error creando usuario: ${e.message}` }, 500, cors), request, env);
+        if (!email || !pass) {
+          return __fix_withCORS(json({ success:false, message:"email y password requeridos" }, 400, cors), request, env);
+        }
+
+        // 1) Intento normal contra tu API interna
+        try {
+          const base = (email.split("@")[0] || "user").replace(/[^a-z0-9._-]/gi,"").toLowerCase() || "user";
+          const suf  = Math.random().toString(36).slice(2,7);
+          const username = `${base}-${suf}`;
+
+          const hdrs = new Headers(request.headers);
+          hdrs.set("content-type","application/json");
+
+          const payload = {
+            username,
+            password: pass,
+            email,
+            role: roleUi,
+            plan: "basic",
+            status: active ? "active" : "paused",
+            name,
+            active
+          };
+
+          const req2 = new Request(new URL("/api/admin/users", request.url), {
+            method: "POST",
+            headers: hdrs,
+            body: JSON.stringify(payload)
+          });
+          const upstream = await handleAdminRoutes(req2, env, "/api/admin/users", "POST", cors);
+
+          if (upstream.status >= 200 && upstream.status < 300) {
+            const data = await (async ()=>{ try{ const t=await upstream.text(); return t?JSON.parse(t):{}; }catch{ return {}; } })();
+            return __fix_withCORS(json({ success:true, ...data }, 201, cors), request, env);
+          }
+        } catch (_) { /* seguimos al fallback */ }
+
+        // 2) Fallback directo a D1
+        try {
+          // email duplicado
+          const dup = await env.DB.prepare(`SELECT id FROM users WHERE email = ?`).bind(email).first();
+          if (dup) return __fix_withCORS(json({ success:false, message:"El email ya está en uso" }, 409, cors), request, env);
+
+          // username único
+          function baseFromEmail(e){ return (e.split("@")[0] || "user").replace(/[^a-z0-9._-]/gi,"").toLowerCase() || "user"; }
+          const base = baseFromEmail(email);
+          let username = `${base}-${Math.random().toString(36).slice(2,7)}`;
+          for (let i=0; i<8; i++){
+            const ex = await env.DB.prepare(`SELECT id FROM users WHERE username = ?`).bind(username).first();
+            if (!ex) break;
+            username = `${base}-${Math.random().toString(36).slice(2,7)}`;
+          }
+
+          // normalizar rol
+          const roleNorm = (()=> {
+            const r = roleUi.toString().toLowerCase();
+            if (["administrador","admin","owner"].includes(r)) return "admin";
+            if (["visualizador","viewer"].includes(r)) return "viewer";
+            return "user"; // Operador
+          })();
+
+          // hash, tenant, trial
+          const hashed = await hashPassword(pass);
+          const tenantId = crypto.randomUUID();
+          const trialEndsAt = new Date(Date.now() + 7*24*60*60*1000).toISOString();
+
+          // insert
+          const res = await env.DB.prepare(`
+            INSERT INTO users (username, password, email, tenant_id, role, plan, status, trial_ends_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+          `).bind(username, hashed, email, tenantId, roleNorm, "basic", active ? "active" : "paused", trialEndsAt).run();
+
+          return __fix_withCORS(json({ success:true, userId: res.meta.last_row_id, tenantId }, 201, cors), request, env);
+        } catch (e) {
+          return __fix_withCORS(json({ success:false, message:`Error creando usuario: ${e.message}` }, 500, cors), request, env);
+        }
+      }
+
+      return __fix_withCORS(json({ error:"Method not allowed" }, 405, cors), request, env);
     }
-  }
-
-  return __fix_withCORS(json({ error:"Method not allowed" }, 405, cors), request, env);
-}
-// === /Adapter consola ===
-if (path.startsWith("/api/admin/")) return __fix_withCORS(await handleAdminRoutes(request, env, path, method, corsHeadersFor(request, env)), request, env);
+    // === /Adapter consola ===
+    
+    if (path.startsWith("/api/admin/")) return __fix_withCORS(await handleAdminRoutes(request, env, path, method, corsHeadersFor(request, env)), request, env);
     if (path.startsWith("/api/app/") || path.startsWith("/api/devices")) {
       return __fix_withCORS(await handleAppRoutes(request, env, path, method, corsHeadersFor(request, env)), request, env);
     }
@@ -971,4 +966,4 @@ if (path.startsWith("/api/admin/")) return __fix_withCORS(await handleAdminRoute
 export {
   worker_default as default
 };
-//# sourceMappingURL=worker.js.map 
+//# sourceMappingURL=worker.js.map
