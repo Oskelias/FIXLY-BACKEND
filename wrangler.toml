@@ -61,6 +61,7 @@ id = "2cfb9502f11849419f17210d01c2ebad"
 # ===== ENVIRONMENT VARIABLES (set via dashboard or wrangler secret) =====
 # Required secrets (set with: wrangler secret put <name>):
 # - JWT_SECRET
+# - AUTH_SECRET
 # - MASTER_KEY
 # - MP_ACCESS_TOKEN (Mercado Pago)
 # - MP_WEBHOOK_SECRET (Mercado Pago)
