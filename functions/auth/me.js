@@ -47,15 +47,15 @@ export async function onRequestGet(context) {
       success: true,
       user: {
         id: user.id,
-        username: user.username,
-        email: user.email,
-        tenantId: user.tenant_id,
-        role: user.role,
-        plan: user.plan,
-        status: user.status,
-        trialEndsAt: user.trial_ends_at,
-        createdAt: user.created_at,
-        lastLogin: user.last_login
+        username: user.username || "",
+        email: user.email || "",
+        tenantId: user.tenant_id || "",
+        role: user.role || "",
+        plan: user.plan || "",
+        status: user.status || "",
+        trialEndsAt: user.trial_ends_at || null,
+        createdAt: user.created_at || null,
+        lastLogin: user.last_login || null
       }
     });
   } catch (err) {
