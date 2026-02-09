@@ -290,7 +290,15 @@ async function handleLogout(request, env) {
 }
 __name(handleLogout, "handleLogout");
 async function handleAdminRoutes(request, env, path, method, cors) {
-  await authenticateRequest(request, env, true);
+  try {
+    await authenticateRequest(request, env, true);
+  } catch (err) {
+    const msg = err && err.message ? err.message : "";
+    if (msg.includes("Admin") || msg.includes("permission")) {
+      return json({ error: "Forbidden" }, 403, cors);
+    }
+    return json({ error: "Unauthorized" }, 401, cors);
+  }
   if (path === "/api/admin/users" && method === "GET") {
     const users = await env.DB.prepare(`
       SELECT id, username, email, role, plan, status, trial_ends_at, created_at, last_login, tenant_id
@@ -366,7 +374,12 @@ async function handleAdminRoutes(request, env, path, method, cors) {
 }
 __name(handleAdminRoutes, "handleAdminRoutes");
 async function handleAppRoutes(request, env, path, method, cors) {
-  const user = await authenticateRequest(request, env);
+  let user;
+  try {
+    user = await authenticateRequest(request, env);
+  } catch {
+    return json({ error: "Unauthorized" }, 401, cors);
+  }
   const tenantId = user.tenantId;
   if (path === "/api/app/dashboard" && method === "GET") {
     const stats = await env.DB.batch([
