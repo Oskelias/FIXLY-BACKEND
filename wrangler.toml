@@ -1,4 +1,4 @@
-name = "fixly-api"
+name = "fixly-backend"
 main = "src/index.ts"
 compatibility_date = "2026-02-01"
 workers_dev = true
