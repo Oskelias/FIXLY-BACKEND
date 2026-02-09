@@ -759,14 +759,14 @@ export default {
             token,
             user: {
               id: userId,
-              email,
-              name: ownerNombre,
+              email: email || "",
+              name: ownerNombre || "",
               role: "owner"
             },
             tenant: {
-              id: tenantId,
-              name: tallerNombre,
-              slug: tenantSlug,
+              id: tenantId || "",
+              name: tallerNombre || "",
+              slug: tenantSlug || "",
               plan: "free"
             }
           },
@@ -1058,12 +1058,12 @@ export default {
             token,
             user: {
               id: user.id,
-              email: user.email,
-              name: user.name,
+              email: user.email || "",
+              name: user.name || "",
               role: user.role || "owner"
             },
             tenant: {
-              id: tenant?.id || user.tenant_id,
+              id: tenant?.id || user.tenant_id || "",
               name: tenant?.name || "",
               slug: tenant?.slug || "",
               plan: tenant?.plan || "free"
@@ -1113,12 +1113,12 @@ export default {
             ok: true,
             user: {
               id: user.id,
-              email: user.email,
-              name: user.name,
+              email: user.email || "",
+              name: user.name || "",
               role: user.role || "owner"
             },
             tenant: {
-              id: tenant?.id || tenantId,
+              id: tenant?.id || tenantId || "",
               name: tenant?.name || "",
               slug: tenant?.slug || "",
               plan,
