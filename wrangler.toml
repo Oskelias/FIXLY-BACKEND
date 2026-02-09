@@ -1,5 +1,7 @@
-name = "fixly-backend"
-compatibility_date = "2025-01-20"
+name = "fixly-api"
+main = "src/index.ts"
+compatibility_date = "2026-02-01"
+workers_dev = true
 
 # Pages Functions configuration
 # The functions are in /functions directory
@@ -59,11 +61,14 @@ id = "2cfb9502f11849419f17210d01c2ebad"
 # ===== ENVIRONMENT VARIABLES (set via dashboard or wrangler secret) =====
 # Required secrets (set with: wrangler secret put <name>):
 # - JWT_SECRET
+# - AUTH_SECRET
+# - QUEUE_SECRET
 # - MASTER_KEY
 # - MP_ACCESS_TOKEN (Mercado Pago)
 # - MP_WEBHOOK_SECRET (Mercado Pago)
 #
 # Optional vars:
+# - ADMIN_BOOTSTRAP_EMAIL (admin bootstrap email for console access)
 # - ADMIN_DOMAIN (e.g., https://admin.fixlytaller.com)
 # - APP_DOMAIN (e.g., https://app.fixlytaller.com)
 # - CORS_ALLOWED (comma-separated list of allowed origins)
