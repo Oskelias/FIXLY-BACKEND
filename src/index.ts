@@ -4,6 +4,7 @@ type Env = {
   DB: D1Database;
   AUTH_SECRET?: string;
   JWT_SECRET?: string;
+  QUEUE_SECRET?: string;
   ADMIN_DOMAIN?: string;
   APP_DOMAIN?: string;
   CORS_ALLOWED?: string;
@@ -19,6 +20,25 @@ const DEFAULT_PERMISSIONS: Record<string, string[]> = {
   pro: ["repairs", "settings", "dashboard", "history", "clients", "whatsapp", "orders_form"],
   business: ["repairs", "settings", "dashboard", "history", "clients", "whatsapp", "orders_form"]
 };
+
+const DEFAULT_TEMPLATES: Array<{ key: string; body: string }> = [
+  {
+    key: "repair_created",
+    body: "Hola {{name}}, recibimos tu reparación {{orderId}}. Te avisaremos novedades. Fixly Taller."
+  },
+  {
+    key: "repair_status_changed",
+    body: "Hola {{name}}, tu reparación {{orderId}} cambió a: {{status}}. Fixly Taller."
+  },
+  {
+    key: "repair_ready",
+    body: "Hola {{name}}, tu reparación {{orderId}} está lista para retirar. Fixly Taller."
+  },
+  {
+    key: "repair_delivered",
+    body: "Hola {{name}}, tu reparación {{orderId}} fue entregada. Gracias por elegir Fixly Taller."
+  }
+];
 
 function jsonResponse(data: unknown, status = 200, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(data), {
@@ -233,6 +253,64 @@ async function ensureSchema(env: Env): Promise<{ tenants: string[]; users: strin
   return { tenants, users };
 }
 
+async function ensureWhatsappSchema(env: Env): Promise<void> {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS whatsapp_settings (
+      tenant_id TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL DEFAULT 0,
+      provider TEXT,
+      sender_id TEXT,
+      token TEXT,
+      webhook_secret TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS message_templates (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      channel TEXT NOT NULL DEFAULT 'whatsapp',
+      body TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      UNIQUE (tenant_id, key)
+    )`
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS message_queue (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      to_phone TEXT NOT NULL,
+      template_key TEXT,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      sent_at TEXT
+    )`
+  ).run();
+  await env.DB.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_message_queue_status_next ON message_queue (status, next_attempt_at)"
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS audit_log (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT,
+      type TEXT,
+      data_json TEXT,
+      created_at TEXT NOT NULL
+    )`
+  ).run();
+}
+
 async function ensureUniqueSlug(env: Env, slug: string, columns: string[]): Promise<string> {
   if (!columns.includes("slug")) {
     return slug;
@@ -292,6 +370,36 @@ function permissionsForPlan(plan?: string): string[] {
   return DEFAULT_PERMISSIONS[plan] || DEFAULT_PERMISSIONS.free;
 }
 
+function hasWhatsappFeature(plan?: string): boolean {
+  return plan === "pro" || plan === "business";
+}
+
+function maskToken(token?: string | null): string | null {
+  if (!token) return null;
+  if (token.length <= 8) return `${token.slice(0, 2)}****`;
+  return `${token.slice(0, 4)}****${token.slice(-4)}`;
+}
+
+function normalizePhone(raw: string): string {
+  let normalized = raw.trim().replace(/[\s-]/g, "");
+  if (normalized && !normalized.startsWith("+")) {
+    normalized = `+${normalized}`;
+  }
+  return normalized;
+}
+
+function renderTemplate(body: string, payload: Record<string, unknown>): string {
+  return body.replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_, key: string) => {
+    const value = payload[key];
+    if (value === undefined || value === null) return "";
+    return String(value);
+  });
+}
+
+function nowISO(): string {
+  return new Date().toISOString();
+}
+
 async function fetchTenantById(
   env: Env,
   tenantId: string,
@@ -314,6 +422,137 @@ async function fetchTenantById(
   };
 }
 
+async function getAuthContext(request: Request, env: Env): Promise<{ userId: string; tenantId: string; plan?: string }> {
+  const auth = request.headers.get("Authorization") || "";
+  if (!auth.startsWith("Bearer ")) {
+    throw new Error("unauthorized");
+  }
+  const secret = getAuthSecret(env);
+  const payload = await verifyToken(auth.slice(7), secret);
+  const userId = String(payload.userId || "");
+  const tenantId = String(payload.tenantId || "");
+  if (!userId || !tenantId) {
+    throw new Error("unauthorized");
+  }
+  const { tenants } = await ensureSchema(env);
+  const tenant = await fetchTenantById(env, tenantId, tenants);
+  return { userId, tenantId, plan: tenant?.plan || "free" };
+}
+
+async function getWhatsappSettings(env: Env, tenantId: string): Promise<{
+  enabled: number;
+  provider: string | null;
+  sender_id: string | null;
+  token: string | null;
+  webhook_secret: string | null;
+}> {
+  await ensureWhatsappSchema(env);
+  const row = await env.DB.prepare(
+    "SELECT enabled, provider, sender_id, token, webhook_secret FROM whatsapp_settings WHERE tenant_id = ?"
+  )
+    .bind(tenantId)
+    .first();
+  if (!row) {
+    return {
+      enabled: 0,
+      provider: null,
+      sender_id: null,
+      token: null,
+      webhook_secret: null
+    };
+  }
+  return {
+    enabled: Number(row.enabled || 0),
+    provider: row.provider ? String(row.provider) : null,
+    sender_id: row.sender_id ? String(row.sender_id) : null,
+    token: row.token ? String(row.token) : null,
+    webhook_secret: row.webhook_secret ? String(row.webhook_secret) : null
+  };
+}
+
+async function upsertWhatsappSettings(
+  env: Env,
+  tenantId: string,
+  settings: {
+    enabled: boolean;
+    provider?: string;
+    sender_id?: string;
+    token?: string;
+    webhook_secret?: string;
+  }
+): Promise<void> {
+  await ensureWhatsappSchema(env);
+  const now = nowISO();
+  const existing = await env.DB.prepare("SELECT tenant_id FROM whatsapp_settings WHERE tenant_id = ?")
+    .bind(tenantId)
+    .first();
+  const enabledValue = settings.enabled ? 1 : 0;
+  const provider = settings.provider || null;
+  const senderId = settings.sender_id || null;
+  const token = settings.token || null;
+  const webhookSecret = settings.webhook_secret || null;
+
+  if (!existing) {
+    await env.DB.prepare(
+      `INSERT INTO whatsapp_settings
+        (tenant_id, enabled, provider, sender_id, token, webhook_secret, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+    )
+      .bind(tenantId, enabledValue, provider, senderId, token, webhookSecret, now, now)
+      .run();
+    return;
+  }
+
+  await env.DB.prepare(
+    `UPDATE whatsapp_settings
+     SET enabled = ?2, provider = ?3, sender_id = ?4, token = ?5, webhook_secret = ?6, updated_at = ?7
+     WHERE tenant_id = ?1`
+  )
+    .bind(tenantId, enabledValue, provider, senderId, token, webhookSecret, now)
+    .run();
+}
+
+async function enqueueMessage(env: Env, params: {
+  tenantId: string;
+  to: string;
+  templateKey?: string | null;
+  payload: Record<string, unknown>;
+}): Promise<void> {
+  await ensureWhatsappSchema(env);
+  const id = crypto.randomUUID();
+  const now = nowISO();
+  await env.DB.prepare(
+    `INSERT INTO message_queue
+      (id, tenant_id, channel, to_phone, template_key, payload_json, status, attempts, next_attempt_at, created_at)
+     VALUES (?1, ?2, 'whatsapp', ?3, ?4, ?5, 'queued', 0, ?6, ?7)`
+  )
+    .bind(
+      id,
+      params.tenantId,
+      params.to,
+      params.templateKey || null,
+      JSON.stringify(params.payload),
+      now,
+      now
+    )
+    .run();
+}
+
+async function logAudit(env: Env, params: { tenantId?: string | null; type: string; data: Record<string, unknown> }) {
+  await ensureWhatsappSchema(env);
+  await env.DB.prepare(
+    "INSERT INTO audit_log (id, tenant_id, type, data_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)"
+  )
+    .bind(
+      crypto.randomUUID(),
+      params.tenantId || null,
+      params.type,
+      JSON.stringify(params.data),
+      nowISO()
+    )
+    .run();
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -322,6 +561,96 @@ export default {
 
     if (method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(request, env) });
+    }
+
+    if (path === "/internal/queue/process" && method === "POST") {
+      const secretHeader = request.headers.get("X-Queue-Secret");
+      if (!env.QUEUE_SECRET || secretHeader !== env.QUEUE_SECRET) {
+        return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+      }
+      await ensureWhatsappSchema(env);
+      const now = nowISO();
+      const batch = await env.DB.prepare(
+        `SELECT id, tenant_id, to_phone, template_key, payload_json
+         FROM message_queue
+         WHERE status = 'queued' AND next_attempt_at <= ?1
+         ORDER BY next_attempt_at ASC
+         LIMIT 25`
+      )
+        .bind(now)
+        .all();
+      let sent = 0;
+      let failed = 0;
+      for (const item of batch.results || []) {
+        const messageId = String(item.id);
+        const tenantId = String(item.tenant_id);
+        await env.DB.prepare("UPDATE message_queue SET status = 'sending' WHERE id = ?1")
+          .bind(messageId)
+          .run();
+        const settings = await getWhatsappSettings(env, tenantId);
+        if (!settings.enabled) {
+          await env.DB.prepare(
+            "UPDATE message_queue SET status = 'failed', last_error = ?2, attempts = attempts + 1, next_attempt_at = ?3 WHERE id = ?1"
+          )
+            .bind(messageId, "whatsapp_disabled", now)
+            .run();
+          failed += 1;
+          continue;
+        }
+        let text = "";
+        const payload = item.payload_json ? JSON.parse(String(item.payload_json)) : {};
+        if (item.template_key) {
+          const template = await env.DB.prepare(
+            "SELECT body, enabled FROM message_templates WHERE tenant_id = ?1 AND key = ?2 LIMIT 1"
+          )
+            .bind(tenantId, String(item.template_key))
+            .first();
+          if (!template || Number(template.enabled) === 0) {
+            await env.DB.prepare(
+              "UPDATE message_queue SET status = 'failed', last_error = ?2, attempts = attempts + 1, next_attempt_at = ?3 WHERE id = ?1"
+            )
+              .bind(messageId, "template_disabled", now)
+              .run();
+            failed += 1;
+            continue;
+          }
+          text = renderTemplate(String(template.body), payload);
+        } else {
+          text = String(payload.message || "");
+        }
+
+        if (settings.provider && settings.provider !== "mock") {
+          const attemptsRow = await env.DB.prepare(
+            "SELECT attempts FROM message_queue WHERE id = ?1"
+          )
+            .bind(messageId)
+            .first();
+          const attempts = Number(attemptsRow?.attempts || 0) + 1;
+          const delayMinutes = Math.min(Math.pow(2, attempts), 60);
+          const nextAttempt = new Date(Date.now() + delayMinutes * 60 * 1000).toISOString();
+          const status = attempts >= 8 ? "dead" : "failed";
+          await env.DB.prepare(
+            "UPDATE message_queue SET status = ?2, attempts = ?3, next_attempt_at = ?4, last_error = ?5 WHERE id = ?1"
+          )
+            .bind(messageId, status, attempts, nextAttempt, "provider_not_configured")
+            .run();
+          failed += 1;
+          continue;
+        }
+
+        await env.DB.prepare(
+          "UPDATE message_queue SET status = 'sent', sent_at = ?2 WHERE id = ?1"
+        )
+          .bind(messageId, now)
+          .run();
+        await logAudit(env, {
+          tenantId,
+          type: "whatsapp_sent",
+          data: { to: item.to_phone, text, template_key: item.template_key }
+        });
+        sent += 1;
+      }
+      return jsonResponse({ ok: true, processed: batch.results?.length || 0, sent, failed });
     }
 
     if (path === "/health" && method === "GET") {
@@ -453,6 +782,231 @@ export default {
       }
     }
 
+    if (path === "/whatsapp/settings" && method === "GET") {
+      try {
+        const authContext = await getAuthContext(request, env);
+        if (!hasWhatsappFeature(authContext.plan)) {
+          return jsonResponse({ ok: false, error: "feature_not_available" }, 403, corsHeaders(request, env));
+        }
+        const settings = await getWhatsappSettings(env, authContext.tenantId);
+        return jsonResponse(
+          {
+            ok: true,
+            settings: {
+              enabled: settings.enabled,
+              provider: settings.provider,
+              sender_id: settings.sender_id,
+              token: maskToken(settings.token),
+              webhook_secret: settings.webhook_secret ? "****" : null
+            }
+          },
+          200,
+          corsHeaders(request, env)
+        );
+      } catch {
+        return jsonResponse({ ok: false, error: "unauthorized" }, 401, corsHeaders(request, env));
+      }
+    }
+
+    if (path === "/whatsapp/settings" && method === "POST") {
+      try {
+        const authContext = await getAuthContext(request, env);
+        if (!hasWhatsappFeature(authContext.plan)) {
+          return jsonResponse({ ok: false, error: "feature_not_available" }, 403, corsHeaders(request, env));
+        }
+        const payload = await readJson(request);
+        const enabled = Boolean(payload.enabled);
+        const provider = payload.provider ? String(payload.provider) : undefined;
+        const senderId = payload.sender_id ? String(payload.sender_id) : undefined;
+        const token = payload.token ? String(payload.token) : undefined;
+        const webhookSecret = payload.webhook_secret ? String(payload.webhook_secret) : undefined;
+        // TODO: encrypt token at rest before storing in D1.
+        await upsertWhatsappSettings(env, authContext.tenantId, {
+          enabled,
+          provider,
+          sender_id: senderId,
+          token,
+          webhook_secret: webhookSecret
+        });
+        const settings = await getWhatsappSettings(env, authContext.tenantId);
+        return jsonResponse(
+          {
+            ok: true,
+            settings: {
+              enabled: settings.enabled,
+              provider: settings.provider,
+              sender_id: settings.sender_id,
+              token: maskToken(settings.token),
+              webhook_secret: settings.webhook_secret ? "****" : null
+            }
+          },
+          200,
+          corsHeaders(request, env)
+        );
+      } catch (error) {
+        return jsonResponse(
+          { ok: false, error: error instanceof Error ? error.message : "unauthorized" },
+          401,
+          corsHeaders(request, env)
+        );
+      }
+    }
+
+    if (path === "/whatsapp/test" && method === "POST") {
+      try {
+        const authContext = await getAuthContext(request, env);
+        if (!hasWhatsappFeature(authContext.plan)) {
+          return jsonResponse({ ok: false, error: "feature_not_available" }, 403, corsHeaders(request, env));
+        }
+        const payload = await readJson(request);
+        const to = payload.to ? normalizePhone(String(payload.to)) : "";
+        const message = payload.message ? String(payload.message) : "";
+        if (!to || !message) {
+          return jsonResponse({ ok: false, error: "to and message are required" }, 400, corsHeaders(request, env));
+        }
+        await enqueueMessage(env, {
+          tenantId: authContext.tenantId,
+          to,
+          templateKey: null,
+          payload: { message }
+        });
+        return jsonResponse({ ok: true }, 202, corsHeaders(request, env));
+      } catch (error) {
+        return jsonResponse(
+          { ok: false, error: error instanceof Error ? error.message : "unauthorized" },
+          401,
+          corsHeaders(request, env)
+        );
+      }
+    }
+
+    if (path === "/templates" && method === "GET") {
+      try {
+        const authContext = await getAuthContext(request, env);
+        if (!hasWhatsappFeature(authContext.plan)) {
+          return jsonResponse({ ok: false, error: "feature_not_available" }, 403, corsHeaders(request, env));
+        }
+        const channel = url.searchParams.get("channel") || "whatsapp";
+        await ensureWhatsappSchema(env);
+        const rows = await env.DB.prepare(
+          "SELECT id, key, channel, body, enabled, created_at FROM message_templates WHERE tenant_id = ?1 AND channel = ?2"
+        )
+          .bind(authContext.tenantId, channel)
+          .all();
+        return jsonResponse(
+          { ok: true, templates: rows.results || [] },
+          200,
+          corsHeaders(request, env)
+        );
+      } catch (error) {
+        return jsonResponse(
+          { ok: false, error: error instanceof Error ? error.message : "unauthorized" },
+          401,
+          corsHeaders(request, env)
+        );
+      }
+    }
+
+    if (path === "/templates" && method === "POST") {
+      try {
+        const authContext = await getAuthContext(request, env);
+        if (!hasWhatsappFeature(authContext.plan)) {
+          return jsonResponse({ ok: false, error: "feature_not_available" }, 403, corsHeaders(request, env));
+        }
+        const payload = await readJson(request);
+        const key = payload.key ? String(payload.key) : "";
+        const channel = payload.channel ? String(payload.channel) : "whatsapp";
+        const body = payload.body ? String(payload.body) : "";
+        const enabled = payload.enabled === undefined ? 1 : payload.enabled ? 1 : 0;
+        if (!key || !body) {
+          return jsonResponse({ ok: false, error: "key and body are required" }, 400, corsHeaders(request, env));
+        }
+        await ensureWhatsappSchema(env);
+        const now = nowISO();
+        const existing = await env.DB.prepare(
+          "SELECT id FROM message_templates WHERE tenant_id = ?1 AND key = ?2 LIMIT 1"
+        )
+          .bind(authContext.tenantId, key)
+          .first();
+        if (existing) {
+          await env.DB.prepare(
+            "UPDATE message_templates SET body = ?3, channel = ?4, enabled = ?5 WHERE tenant_id = ?1 AND key = ?2"
+          )
+            .bind(authContext.tenantId, key, body, channel, enabled)
+            .run();
+        } else {
+          await env.DB.prepare(
+            `INSERT INTO message_templates (id, tenant_id, key, channel, body, enabled, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`
+          )
+            .bind(crypto.randomUUID(), authContext.tenantId, key, channel, body, enabled, now)
+            .run();
+        }
+        return jsonResponse({ ok: true }, 200, corsHeaders(request, env));
+      } catch (error) {
+        return jsonResponse(
+          { ok: false, error: error instanceof Error ? error.message : "unauthorized" },
+          401,
+          corsHeaders(request, env)
+        );
+      }
+    }
+
+    if (path === "/templates/seed" && method === "POST") {
+      try {
+        const authContext = await getAuthContext(request, env);
+        if (!hasWhatsappFeature(authContext.plan)) {
+          return jsonResponse({ ok: false, error: "feature_not_available" }, 403, corsHeaders(request, env));
+        }
+        await ensureWhatsappSchema(env);
+        const existing = await env.DB.prepare(
+          "SELECT COUNT(*) as count FROM message_templates WHERE tenant_id = ?1 AND channel = 'whatsapp'"
+        )
+          .bind(authContext.tenantId)
+          .first();
+        if (!existing || Number(existing.count) === 0) {
+          const now = nowISO();
+          for (const template of DEFAULT_TEMPLATES) {
+            await env.DB.prepare(
+              `INSERT INTO message_templates (id, tenant_id, key, channel, body, enabled, created_at)
+               VALUES (?1, ?2, ?3, 'whatsapp', ?4, 1, ?5)`
+            )
+              .bind(crypto.randomUUID(), authContext.tenantId, template.key, template.body, now)
+              .run();
+          }
+        }
+        return jsonResponse({ ok: true }, 200, corsHeaders(request, env));
+      } catch (error) {
+        return jsonResponse(
+          { ok: false, error: error instanceof Error ? error.message : "unauthorized" },
+          401,
+          corsHeaders(request, env)
+        );
+      }
+    }
+
+    if (path === "/whatsapp/webhook" && method === "POST") {
+      try {
+        const tenantId = request.headers.get("X-Tenant-Id") || url.searchParams.get("tenantId") || "";
+        if (!tenantId) {
+          return jsonResponse({ ok: false, error: "tenant_id_required" }, 400);
+        }
+        const settings = await getWhatsappSettings(env, tenantId);
+        const providedSecret =
+          request.headers.get("X-Webhook-Secret") ||
+          url.searchParams.get("secret") ||
+          "";
+        if (!settings.webhook_secret || settings.webhook_secret !== providedSecret) {
+          return jsonResponse({ ok: false, error: "unauthorized" }, 403);
+        }
+        const payload = await readJson(request);
+        await logAudit(env, { tenantId, type: "whatsapp_inbound", data: payload });
+        return jsonResponse({ ok: true }, 200);
+      } catch {
+        return jsonResponse({ ok: false, error: "bad_request" }, 400);
+      }
+    }
+
     if (path === "/auth/public/login" && method === "POST") {
       try {
         const payload = await readJson(request);
@@ -577,6 +1131,76 @@ export default {
       } catch {
         return jsonResponse({ ok: false, error: "unauthorized" }, 401, corsHeaders(request, env));
       }
+    }
+
+    if (path.startsWith("/api/app/reparaciones/") && (method === "PUT" || method === "PATCH")) {
+      const bodyText = await request.text();
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : {};
+      } catch {
+        payload = {};
+      }
+      const statusNext = payload.estado ? String(payload.estado) : "";
+      let authContext: { tenantId: string; plan?: string } | null = null;
+      try {
+        authContext = await getAuthContext(request, env);
+      } catch {
+        authContext = null;
+      }
+      let previousStatus = "";
+      let repairRow: Record<string, unknown> | null = null;
+      if (authContext && statusNext) {
+        const repairId = path.split("/").pop() || "";
+        repairRow = await env.DB.prepare(
+          "SELECT id, orden_id, cliente, telefono, equipo, estado FROM reparaciones WHERE id = ?1 AND tenant_id = ?2 LIMIT 1"
+        )
+          .bind(repairId, authContext.tenantId)
+          .first();
+        previousStatus = repairRow?.estado ? String(repairRow.estado) : "";
+      }
+      const forwarded = await worker.fetch(
+        new Request(request, { body: bodyText }),
+        env,
+        ctx
+      );
+      if (
+        forwarded.ok &&
+        authContext &&
+        statusNext &&
+        statusNext !== previousStatus &&
+        hasWhatsappFeature(authContext.plan)
+      ) {
+        const settings = await getWhatsappSettings(env, authContext.tenantId);
+        const phone = repairRow?.telefono ? normalizePhone(String(repairRow.telefono)) : "";
+        if (settings.enabled && phone) {
+          const templateKey = "repair_status_changed";
+          const payloadData = {
+            name: repairRow?.cliente || "",
+            orderId: repairRow?.orden_id || repairRow?.id || "",
+            status: statusNext,
+            device: repairRow?.equipo || "",
+            link: ""
+          };
+          await enqueueMessage(env, {
+            tenantId: authContext.tenantId,
+            to: phone,
+            templateKey,
+            payload: payloadData
+          });
+          await logAudit(env, {
+            tenantId: authContext.tenantId,
+            type: "repair_status_changed",
+            data: {
+              repairId: repairRow?.id || "",
+              previousStatus,
+              statusNext,
+              to: phone
+            }
+          });
+        }
+      }
+      return forwarded;
     }
 
     return worker.fetch(request, env, ctx);
