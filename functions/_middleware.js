@@ -1,116 +1,82 @@
-// ==== GLOBAL CORS + ERROR HANDLER MIDDLEWARE FOR CLOUDFLARE PAGES FUNCTIONS ====
+// ==== GLOBAL CORS MIDDLEWARE FOR CLOUDFLARE PAGES FUNCTIONS ====
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Tenant-Id, X-Location-Id, X-Master-Key",
-  "Access-Control-Max-Age": "86400",
-  "Access-Control-Allow-Credentials": "true"
-};
+// Fixed CORS headers
+const CORS_METHODS = "GET, POST, PUT, DELETE, PATCH, OPTIONS";
+const CORS_HEADERS_ALLOWED = "Content-Type, Authorization, X-Tenant-Id, X-Location-Id, X-Master-Key";
+const CORS_MAX_AGE = "86400";
 
-// Known allowed origins
-const KNOWN_ORIGINS = [
+// Allowed origins - ALWAYS allow these
+const ALLOWED_ORIGINS = [
   "https://admin.fixlytaller.com",
   "https://app.fixlytaller.com",
   "https://fixlytaller.com",
   "http://localhost:3000",
   "http://localhost:5173",
+  "http://localhost:8080",
   "http://127.0.0.1:3000",
-  "http://127.0.0.1:5173"
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:8080"
 ];
 
-function getAllowedOrigins(env) {
-  const origins = new Set(KNOWN_ORIGINS);
-
-  // Add configured domains
-  if (env?.ADMIN_DOMAIN) origins.add(env.ADMIN_DOMAIN.trim());
-  if (env?.APP_DOMAIN) origins.add(env.APP_DOMAIN.trim());
-
-  // Add from CORS_ALLOWED comma-separated list
-  if (env?.CORS_ALLOWED) {
-    env.CORS_ALLOWED.split(",").forEach(o => {
-      const v = (o || "").trim();
-      if (v) origins.add(v);
-    });
-  }
-
-  return origins;
-}
-
-function getCorsHeaders(request, env) {
+function getCorsHeaders(request) {
   const origin = request.headers.get("Origin") || "";
-  const allowed = getAllowedOrigins(env);
 
-  // If origin is in allowed list
-  if (origin && allowed.has(origin)) {
-    return {
-      ...CORS_HEADERS,
-      "Access-Control-Allow-Origin": origin,
-      "Vary": "Origin"
-    };
-  }
+  // Check if origin is allowed
+  const isAllowed = ALLOWED_ORIGINS.includes(origin) || origin.endsWith(".fixlytaller.com");
 
-  // Default: allow all for MVP
+  // IMPORTANT: When using credentials, we CANNOT use "*"
+  // We must echo back the specific origin
+  const allowOrigin = isAllowed ? origin : ALLOWED_ORIGINS[0];
+
   return {
-    ...CORS_HEADERS,
-    "Access-Control-Allow-Origin": "*"
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": CORS_METHODS,
+    "Access-Control-Allow-Headers": CORS_HEADERS_ALLOWED,
+    "Access-Control-Max-Age": CORS_MAX_AGE,
+    "Vary": "Origin"
   };
 }
 
-// Standard JSON response helper
-function jsonResponse(data, status, corsHeaders) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      ...corsHeaders
-    }
-  });
+// Helper to create JSON response with CORS
+function corsJson(data, status, request) {
+  const headers = {
+    "Content-Type": "application/json",
+    ...getCorsHeaders(request)
+  };
+
+  return new Response(JSON.stringify(data), { status, headers });
 }
 
 export async function onRequest(context) {
   const { request, env, next } = context;
-  const url = new URL(request.url);
   const method = request.method;
+  const url = new URL(request.url);
   const path = url.pathname;
 
-  // Log incoming request
-  console.log(`[MIDDLEWARE] ${method} ${path}`);
+  // Get CORS headers for this request
+  const corsHeaders = getCorsHeaders(request);
 
-  const corsHeaders = getCorsHeaders(request, env);
-
-  // Handle preflight OPTIONS
+  // ALWAYS handle OPTIONS preflight first
   if (method === "OPTIONS") {
-    console.log(`[MIDDLEWARE] Preflight OK for ${path}`);
     return new Response(null, {
       status: 204,
       headers: corsHeaders
     });
   }
 
-  // Continue to the actual handler
   try {
+    // Call the actual handler
     const response = await next();
 
-    // Check for 404 (no handler found)
-    if (response.status === 404) {
-      // Check if it's a real 404 from our code or Pages Functions 404
-      const contentType = response.headers.get("Content-Type") || "";
-      if (!contentType.includes("application/json")) {
-        console.log(`[MIDDLEWARE] 404 - Route not found: ${path}`);
-        return jsonResponse({
-          success: false,
-          error: `Endpoint not found: ${method} ${path}`
-        }, 404, corsHeaders);
-      }
-    }
-
-    // Add CORS headers to response
+    // Clone response and add CORS headers
     const newHeaders = new Headers(response.headers);
-    for (const [key, value] of Object.entries(corsHeaders)) {
-      newHeaders.set(key, value);
-    }
 
-    // Ensure Content-Type is set
+    // Add ALL CORS headers
+    Object.entries(corsHeaders).forEach(([key, value]) => {
+      newHeaders.set(key, value);
+    });
+
+    // Ensure Content-Type
     if (!newHeaders.has("Content-Type")) {
       newHeaders.set("Content-Type", "application/json");
     }
@@ -120,27 +86,25 @@ export async function onRequest(context) {
       statusText: response.statusText,
       headers: newHeaders
     });
-  } catch (err) {
-    // Global error handler - NEVER return empty response
-    console.error(`[MIDDLEWARE] Error on ${method} ${path}:`, err.message, err.stack);
 
-    // Determine status code based on error
+  } catch (err) {
+    // Error handler - ALWAYS return JSON with CORS headers
+    console.error(`[CORS-MW] Error: ${method} ${path}`, err.message);
+
     let status = 500;
-    if (err.message.includes("token") || err.message.includes("authorization")) {
+    const msg = err.message || "";
+
+    if (msg.includes("token") || msg.includes("authorization") || msg.includes("No authorization")) {
       status = 401;
-    } else if (err.message.includes("Admin") || err.message.includes("permission")) {
+    } else if (msg.includes("Admin") || msg.includes("permission")) {
       status = 403;
-    } else if (err.message.includes("not found")) {
+    } else if (msg.includes("not found")) {
       status = 404;
-    } else if (err.message.includes("already exists") || err.message.includes("UNIQUE")) {
-      status = 409;
-    } else if (err.message.includes("required") || err.message.includes("invalid")) {
-      status = 400;
     }
 
-    return jsonResponse({
+    return corsJson({
       success: false,
       error: err.message || "Internal server error"
-    }, status, corsHeaders);
+    }, status, request);
   }
 }
