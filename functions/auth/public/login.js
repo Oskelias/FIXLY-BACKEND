@@ -68,11 +68,11 @@ export async function onRequestPost(context) {
       token,
       user: {
         id: user.id,
-        username: user.username,
-        tenantId: user.tenant_id,
-        role: user.role,
-        plan: user.plan,
-        status: user.status,
+        username: user.username || "",
+        tenantId: user.tenant_id || "",
+        role: user.role || "",
+        plan: user.plan || "",
+        status: user.status || "",
         redirectUrl: user.role === "admin" ? "/admin" : "/app"
       }
     });
