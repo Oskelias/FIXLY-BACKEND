@@ -78,7 +78,14 @@ export async function hashPassword(password) {
 }
 
 export async function verifyPassword(password, hash) {
-  return (await hashPassword(password)) === hash;
+  if (typeof hash !== "string") return false;
+  const normalized = hash.trim();
+  const computed = await hashPassword(password);
+
+  if (computed === normalized) return true;
+  if (/^[a-fA-F0-9]{64}$/.test(normalized) && computed === normalized.toLowerCase()) return true;
+
+  return false;
 }
 
 // ==== AUTH HELPERS ====
