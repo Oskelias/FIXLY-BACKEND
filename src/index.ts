@@ -615,6 +615,32 @@ async function getTableColumns(env: Env, table: string): Promise<string[]> {
   return (info.results || []).map((row) => String(row.name));
 }
 
+async function safeCount(env: Env, table: string, where = "", binds: unknown[] = []): Promise<number> {
+  try {
+    const columns = await getTableColumns(env, table);
+    if (!columns.length) return 0;
+    const query = `SELECT COUNT(*) as count FROM ${table}${where ? ` WHERE ${where}` : ""}`;
+    const stmt = env.DB.prepare(query);
+    const row = binds.length ? await stmt.bind(...binds).first() : await stmt.first();
+    return Number(row?.count || 0);
+  } catch {
+    return 0;
+  }
+}
+
+async function safeRevenue(env: Env): Promise<number> {
+  try {
+    const columns = await getTableColumns(env, "pedidos");
+    if (!columns.length) return 0;
+    const amountColumn = columns.includes("precio_total") ? "precio_total" : columns.includes("total") ? "total" : null;
+    if (!amountColumn) return 0;
+    const row = await env.DB.prepare(`SELECT COALESCE(SUM(${amountColumn}), 0) as total FROM pedidos`).first();
+    return Number(row?.total || 0);
+  } catch {
+    return 0;
+  }
+}
+
 function isUserActive(row: { status?: string | number | null; active?: string | number | null }): boolean {
   if (row.active !== undefined && row.active !== null) {
     if (typeof row.active === "number") return row.active === 1;
@@ -733,22 +759,14 @@ export default {
     if (path === "/auth/public/register" && method === "POST") {
       try {
         const payload = await readJson(request);
-        const tallerNombre = String(payload.tallerNombre || "").trim();
-        const ownerNombre = String(payload.ownerNombre || "").trim();
+        const ownerName = String(payload.nombre || payload.ownerName || payload.ownerNombre || "").trim();
         const emailRaw = String(payload.email || "").trim();
+        const companyName = String(payload.empresa || payload.workshopName || payload.tallerNombre || "").trim();
         const password = String(payload.password || "");
 
-        if (!tallerNombre || !ownerNombre || !emailRaw) {
+        if (!ownerName || !emailRaw || !password || !companyName) {
           return jsonResponse(
-            { ok: false, message: "tallerNombre, ownerNombre, and email are required" },
-            400,
-            corsHeaders(request, env)
-          );
-        }
-
-        if (!password) {
-          return jsonResponse(
-            { ok: false, message: "password is required" },
+            { ok: false, error: "nombre, email, password and empresa are required" },
             400,
             corsHeaders(request, env)
           );
@@ -768,10 +786,10 @@ export default {
         const tenantPlanColumn = getTenantPlanColumn(tenants);
         const tenantSlugColumn = getTenantSlugColumn(tenants);
         const tenantCreatedColumn = getTenantCreatedColumn(tenants);
-        const baseSlug = slugify(tallerNombre);
+        const baseSlug = slugify(companyName);
         const tenantSlug = await ensureUniqueSlug(env, baseSlug, tenants);
         const tenantColumns = ["id", tenantNameColumn];
-        const tenantValues: (string | null)[] = [tenantId, tallerNombre];
+        const tenantValues: (string | null)[] = [tenantId, companyName];
         if (tenantSlugColumn) {
           tenantColumns.push(tenantSlugColumn);
           tenantValues.push(tenantSlug);
@@ -783,6 +801,13 @@ export default {
         if (tenantCreatedColumn) {
           tenantColumns.push(tenantCreatedColumn);
           tenantValues.push(new Date().toISOString());
+        }
+        if (tenants.includes("active")) {
+          tenantColumns.push("active");
+          tenantValues.push("1");
+        } else if (tenants.includes("status")) {
+          tenantColumns.push("status");
+          tenantValues.push("active");
         }
         const tenantInsert = `INSERT INTO tenants (${tenantColumns.join(", ")}) VALUES (${tenantColumns.map(() => "?").join(", ")})`;
         await env.DB.prepare(tenantInsert).bind(...tenantValues).run();
@@ -796,18 +821,11 @@ export default {
         const userValues: (string | null)[] = [
           userId,
           tenantId,
-          ownerNombre,
+          ownerName,
           email,
           passwordHash,
-          "owner"
+          "admin"
         ];
-        if (users.includes("phone")) {
-          userColumns.push("phone");
-          userValues.push(payload.telefono ? String(payload.telefono) : "");
-        } else if (users.includes("telefono")) {
-          userColumns.push("telefono");
-          userValues.push(payload.telefono ? String(payload.telefono) : "");
-        }
         if (createdColumn) {
           userColumns.push(createdColumn);
           userValues.push(new Date().toISOString());
@@ -815,41 +833,53 @@ export default {
         const userInsert = `INSERT INTO users (${userColumns.join(", ")}) VALUES (${userColumns.map(() => "?").join(", ")})`;
         await env.DB.prepare(userInsert).bind(...userValues).run();
 
-        const secret = getAuthSecret(env);
-        const token = await signToken(
-          {
-            userId,
-            tenantId,
-            role: "owner",
-            exp: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60
-          },
-          secret
-        );
-
         return jsonResponse(
           {
             ok: true,
-            token,
-            user: {
-              id: userId,
-              email,
-              name: ownerNombre,
-              role: "owner"
-            },
-            tenant: {
-              id: tenantId,
-              name: tallerNombre,
-              slug: tenantSlug,
-              plan: "free"
-            }
+            message: "Account created successfully"
           },
-          201,
+          200,
           corsHeaders(request, env)
         );
       } catch (error) {
         return jsonResponse(
-          { ok: false, error: error instanceof Error ? error.message : "Unexpected error" },
+          { ok: false, error: "could not create account" },
           400,
+          corsHeaders(request, env)
+        );
+      }
+    }
+
+    if (path === "/api/admin/stats" && method === "GET") {
+      try {
+        await getAuthContext(request, env);
+        const totalTickets = await safeCount(env, "reparaciones");
+        const openTickets = await safeCount(env, "reparaciones", "estado IS NULL OR lower(estado) NOT IN ('entregado','completado','completed','closed')");
+        const completedTickets = await safeCount(env, "reparaciones", "lower(estado) IN ('entregado','completado','completed','closed')");
+        const totalClients = await safeCount(env, "clientes");
+        const totalRevenue = await safeRevenue(env);
+
+        return jsonResponse(
+          {
+            ok: true,
+            stats: {
+              totalTickets,
+              openTickets,
+              completedTickets,
+              totalClients,
+              totalRevenue
+            }
+          },
+          200,
+          corsHeaders(request, env)
+        );
+      } catch {
+        return jsonResponse(
+          {
+            ok: false,
+            error: "unauthorized"
+          },
+          401,
           corsHeaders(request, env)
         );
       }
@@ -1079,7 +1109,6 @@ export default {
         return jsonResponse({ ok: false, error: "bad_request" }, 400);
       }
     }
-
     if (path === "/admin/stats" && method === "GET") {
       try {
         const authContext = await getAuthContext(request, env);
