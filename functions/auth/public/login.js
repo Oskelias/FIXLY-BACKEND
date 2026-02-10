@@ -1,5 +1,5 @@
 // POST /auth/public/login - Public login endpoint
-import { json, verifyPassword, generateJWT, manageDeviceSessions, nowISO } from "../../_lib.js";
+import { json, verifyPassword, hashPassword, generateJWT, manageDeviceSessions, nowISO } from "../../_lib.js";
 
 export async function onRequestPost(context) {
   const { request, env } = context;
@@ -21,7 +21,16 @@ export async function onRequestPost(context) {
     }
 
     // Verify password
-    const ok = await verifyPassword(password, user.password);
+    let ok = await verifyPassword(password, user.password);
+
+    // Legacy compatibility: if an old record still stores plaintext,
+    // allow one successful login and migrate it to SHA-256 immediately.
+    if (!ok && typeof user.password === "string" && user.password === password) {
+      const migratedHash = await hashPassword(password);
+      await env.DB.prepare(`UPDATE users SET password = ? WHERE id = ?`).bind(migratedHash, user.id).run();
+      ok = true;
+    }
+
     if (!ok) {
       return json({ success: false, error: "Invalid credentials" }, 401);
     }
