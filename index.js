@@ -204,7 +204,14 @@ async function hashPassword(password) {
 }
 
 async function verifyPassword(password, hash) {
-  return (await hashPassword(password)) === hash;
+  if (typeof hash !== "string") return false;
+  const normalized = hash.trim();
+  const computed = await hashPassword(password);
+
+  if (computed === normalized) return true;
+  if (/^[a-fA-F0-9]{64}$/.test(normalized) && computed === normalized.toLowerCase()) return true;
+
+  return false;
 }
 
 async function authenticateRequest(request, env, requireAdmin = false) {
@@ -272,7 +279,16 @@ async function handleLogin(request, env) {
 
   if (!user) return json({ success: false, error: "Invalid credentials" }, 401);
 
-  const ok = await verifyPassword(password, user.password);
+  let ok = await verifyPassword(password, user.password);
+
+  // Legacy compatibility: if an old record still stores plaintext,
+  // allow one successful login and migrate it to SHA-256 immediately.
+  if (!ok && typeof user.password === "string" && user.password === password) {
+    const migratedHash = await hashPassword(password);
+    await env.DB.prepare(`UPDATE users SET password = ? WHERE id = ?`).bind(migratedHash, user.id).run();
+    ok = true;
+  }
+
   if (!ok) return json({ success: false, error: "Invalid credentials" }, 401);
 
   if (user.status === "paused") return json({ success: false, error: "Account is paused" }, 403);
