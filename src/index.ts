@@ -652,6 +652,98 @@ async function safeRevenue(env: Env): Promise<number> {
   }
 }
 
+async function ensureWorkshopSchema(env: Env): Promise<void> {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS clients (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      phone TEXT,
+      email TEXT,
+      dni TEXT,
+      notes TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS tickets (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      client_id TEXT,
+      order_number TEXT NOT NULL,
+      device_type TEXT,
+      brand TEXT,
+      model TEXT,
+      issue TEXT,
+      accessories TEXT,
+      estimated_cost INTEGER DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'received',
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      UNIQUE (tenant_id, order_number)
+    )`
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS ticket_events (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      ticket_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      note TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`
+  ).run();
+
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_tickets_tenant_status ON tickets (tenant_id, status)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_clients_tenant ON clients (tenant_id)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_ticket_events_ticket ON ticket_events (ticket_id)").run();
+}
+
+async function getTenantIdFromRequest(request: Request, env: Env): Promise<string> {
+  const auth = await getAuthContext(request, env);
+  if (!auth.tenantId) throw new Error("unauthorized");
+  return auth.tenantId;
+}
+
+async function generateOrderNumber(env: Env, tenantId: string): Promise<string> {
+  for (let i = 0; i < 20; i += 1) {
+    const value = Math.floor(100000 + Math.random() * 900000);
+    const orderNumber = `FX-${value}`;
+    const existing = await env.DB.prepare(
+      "SELECT id FROM tickets WHERE tenant_id = ?1 AND order_number = ?2 LIMIT 1"
+    )
+      .bind(tenantId, orderNumber)
+      .first();
+    if (!existing) return orderNumber;
+  }
+  throw new Error("could not generate order number");
+}
+
+function ticketStatusMessage(status: string): string {
+  const map: Record<string, string> = {
+    received: "Tu equipo fue recibido en el taller.",
+    in_progress: "Tu equipo está en proceso de reparación.",
+    ready: "Tu equipo está listo para retirar.",
+    delivered: "Tu equipo ya fue entregado.",
+    cancelled: "La orden fue cancelada. Contactanos para más información."
+  };
+  return map[status] || "Estado actualizado.";
+}
+
+function isValidStatusTransition(currentStatus: string, nextStatus: string): boolean {
+  if (nextStatus === "cancelled") return true;
+  const transitions: Record<string, string[]> = {
+    received: ["in_progress"],
+    in_progress: ["ready"],
+    ready: ["delivered"],
+    delivered: [],
+    cancelled: []
+  };
+  return (transitions[currentStatus] || []).includes(nextStatus);
+}
+
 function isUserActive(row: { status?: string | number | null; active?: string | number | null }): boolean {
   if (row.active !== undefined && row.active !== null) {
     if (typeof row.active === "number") return row.active === 1;
@@ -865,14 +957,366 @@ export default {
       }
     }
 
+    if (path === "/api/clients" && method === "GET") {
+      try {
+        const tenantId = await getTenantIdFromRequest(request, env);
+        await ensureWorkshopSchema(env);
+        const rows = await env.DB.prepare(
+          `SELECT id, name, phone, email, dni, notes, created_at
+           FROM clients
+           WHERE tenant_id = ?1
+           ORDER BY datetime(created_at) DESC`
+        ).bind(tenantId).all();
+        return jsonResponse({ ok: true, clients: rows.results || [] }, 200, corsHeaders(request, env));
+      } catch {
+        return jsonResponse({ ok: false, error: "unauthorized" }, 401, corsHeaders(request, env));
+      }
+    }
+
+    if (path === "/api/clients" && method === "POST") {
+      try {
+        const tenantId = await getTenantIdFromRequest(request, env);
+        await ensureWorkshopSchema(env);
+        const payload = await readJson(request);
+        const name = String(payload.name || "").trim();
+        if (!name) return jsonResponse({ ok: false, error: "name is required" }, 400, corsHeaders(request, env));
+
+        const id = crypto.randomUUID();
+        await env.DB.prepare(
+          `INSERT INTO clients (id, tenant_id, name, phone, email, dni, notes, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))`
+        )
+          .bind(
+            id,
+            tenantId,
+            name,
+            payload.phone ? String(payload.phone) : null,
+            payload.email ? String(payload.email).toLowerCase() : null,
+            payload.dni ? String(payload.dni) : null,
+            payload.notes ? String(payload.notes) : null
+          )
+          .run();
+
+        const client = await env.DB.prepare(
+          "SELECT id, name, phone, email, dni, notes, created_at FROM clients WHERE id = ?1 AND tenant_id = ?2 LIMIT 1"
+        ).bind(id, tenantId).first();
+
+        return jsonResponse({ ok: true, client }, 201, corsHeaders(request, env));
+      } catch {
+        return jsonResponse({ ok: false, error: "could not create client" }, 400, corsHeaders(request, env));
+      }
+    }
+
+    if (path.startsWith("/api/clients/") && method === "GET") {
+      try {
+        const tenantId = await getTenantIdFromRequest(request, env);
+        await ensureWorkshopSchema(env);
+        const id = path.split("/").pop() || "";
+        const client = await env.DB.prepare(
+          `SELECT id, name, phone, email, dni, notes, created_at
+           FROM clients WHERE id = ?1 AND tenant_id = ?2 LIMIT 1`
+        ).bind(id, tenantId).first();
+        if (!client) return jsonResponse({ ok: false, error: "Client not found" }, 404, corsHeaders(request, env));
+        return jsonResponse({ ok: true, client }, 200, corsHeaders(request, env));
+      } catch {
+        return jsonResponse({ ok: false, error: "unauthorized" }, 401, corsHeaders(request, env));
+      }
+    }
+
+    if (path.startsWith("/api/clients/") && method === "PUT") {
+      try {
+        const tenantId = await getTenantIdFromRequest(request, env);
+        await ensureWorkshopSchema(env);
+        const id = path.split("/").pop() || "";
+        const payload = await readJson(request);
+        const existing = await env.DB.prepare("SELECT id FROM clients WHERE id = ?1 AND tenant_id = ?2 LIMIT 1")
+          .bind(id, tenantId)
+          .first();
+        if (!existing) return jsonResponse({ ok: false, error: "Client not found" }, 404, corsHeaders(request, env));
+
+        await env.DB.prepare(
+          `UPDATE clients
+           SET name = COALESCE(?3, name),
+               phone = COALESCE(?4, phone),
+               email = COALESCE(?5, email),
+               dni = COALESCE(?6, dni),
+               notes = COALESCE(?7, notes)
+           WHERE id = ?1 AND tenant_id = ?2`
+        )
+          .bind(
+            id,
+            tenantId,
+            payload.name ? String(payload.name) : null,
+            payload.phone ? String(payload.phone) : null,
+            payload.email ? String(payload.email).toLowerCase() : null,
+            payload.dni ? String(payload.dni) : null,
+            payload.notes ? String(payload.notes) : null
+          )
+          .run();
+
+        const client = await env.DB.prepare(
+          "SELECT id, name, phone, email, dni, notes, created_at FROM clients WHERE id = ?1 AND tenant_id = ?2 LIMIT 1"
+        ).bind(id, tenantId).first();
+
+        return jsonResponse({ ok: true, client }, 200, corsHeaders(request, env));
+      } catch {
+        return jsonResponse({ ok: false, error: "could not update client" }, 400, corsHeaders(request, env));
+      }
+    }
+
+    if (path.startsWith("/api/clients/") && method === "DELETE") {
+      try {
+        const tenantId = await getTenantIdFromRequest(request, env);
+        await ensureWorkshopSchema(env);
+        const id = path.split("/").pop() || "";
+        const existing = await env.DB.prepare("SELECT id FROM clients WHERE id = ?1 AND tenant_id = ?2 LIMIT 1")
+          .bind(id, tenantId)
+          .first();
+        if (!existing) return jsonResponse({ ok: false, error: "Client not found" }, 404, corsHeaders(request, env));
+        await env.DB.prepare("DELETE FROM clients WHERE id = ?1 AND tenant_id = ?2")
+          .bind(id, tenantId)
+          .run();
+        return jsonResponse({ ok: true }, 200, corsHeaders(request, env));
+      } catch {
+        return jsonResponse({ ok: false, error: "could not delete client" }, 400, corsHeaders(request, env));
+      }
+    }
+
+    if (path === "/api/tickets" && method === "GET") {
+      try {
+        const tenantId = await getTenantIdFromRequest(request, env);
+        await ensureWorkshopSchema(env);
+        const status = url.searchParams.get("status");
+        const allowed = ["received", "in_progress", "ready", "delivered", "cancelled"];
+        const hasStatus = Boolean(status && allowed.includes(status));
+        const rows = hasStatus
+          ? await env.DB.prepare(
+            `SELECT id, order_number, client_id, device_type, brand, model, issue, accessories, estimated_cost, status, created_at, updated_at
+             FROM tickets WHERE tenant_id = ?1 AND status = ?2 ORDER BY datetime(created_at) DESC`
+          ).bind(tenantId, status).all()
+          : await env.DB.prepare(
+            `SELECT id, order_number, client_id, device_type, brand, model, issue, accessories, estimated_cost, status, created_at, updated_at
+             FROM tickets WHERE tenant_id = ?1 ORDER BY datetime(created_at) DESC`
+          ).bind(tenantId).all();
+
+        return jsonResponse({ ok: true, tickets: rows.results || [] }, 200, corsHeaders(request, env));
+      } catch {
+        return jsonResponse({ ok: false, error: "unauthorized" }, 401, corsHeaders(request, env));
+      }
+    }
+
+    if (path === "/api/tickets" && method === "POST") {
+      try {
+        const tenantId = await getTenantIdFromRequest(request, env);
+        await ensureWorkshopSchema(env);
+        const payload = await readJson(request);
+        const issue = String(payload.issue || "").trim();
+        if (!issue) return jsonResponse({ ok: false, error: "issue is required" }, 400, corsHeaders(request, env));
+
+        const id = crypto.randomUUID();
+        const orderNumber = await generateOrderNumber(env, tenantId);
+        const estimatedCost = Number(payload.estimated_cost || 0);
+
+        let clientId: string | null = null;
+        if (payload.client_id) {
+          const existingClient = await env.DB.prepare("SELECT id FROM clients WHERE id = ?1 AND tenant_id = ?2 LIMIT 1")
+            .bind(String(payload.client_id), tenantId)
+            .first();
+          if (!existingClient) return jsonResponse({ ok: false, error: "Client not found" }, 404, corsHeaders(request, env));
+          clientId = String(payload.client_id);
+        }
+
+        await env.DB.prepare(
+          `INSERT INTO tickets (
+             id, tenant_id, client_id, order_number, device_type, brand, model, issue, accessories, estimated_cost, status, created_at, updated_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'received', datetime('now'), datetime('now'))`
+        )
+          .bind(
+            id,
+            tenantId,
+            clientId,
+            orderNumber,
+            payload.device_type ? String(payload.device_type) : null,
+            payload.brand ? String(payload.brand) : null,
+            payload.model ? String(payload.model) : null,
+            issue,
+            payload.accessories ? String(payload.accessories) : null,
+            Number.isFinite(estimatedCost) ? Math.max(0, Math.round(estimatedCost)) : 0
+          )
+          .run();
+
+        await env.DB.prepare(
+          `INSERT INTO ticket_events (id, tenant_id, ticket_id, status, note, created_at)
+           VALUES (?1, ?2, ?3, 'received', ?4, datetime('now'))`
+        )
+          .bind(crypto.randomUUID(), tenantId, id, "Ticket creado")
+          .run();
+
+        const ticket = await env.DB.prepare(
+          `SELECT id, order_number, client_id, device_type, brand, model, issue, accessories, estimated_cost, status, created_at, updated_at
+           FROM tickets WHERE id = ?1 AND tenant_id = ?2 LIMIT 1`
+        ).bind(id, tenantId).first();
+
+        return jsonResponse({ ok: true, ticket }, 201, corsHeaders(request, env));
+      } catch {
+        return jsonResponse({ ok: false, error: "could not create ticket" }, 400, corsHeaders(request, env));
+      }
+    }
+
+    if (path.startsWith("/api/tickets/") && method === "GET" && !path.endsWith("/status")) {
+      try {
+        const tenantId = await getTenantIdFromRequest(request, env);
+        await ensureWorkshopSchema(env);
+        const id = path.split("/").pop() || "";
+        const ticket = await env.DB.prepare(
+          `SELECT id, order_number, client_id, device_type, brand, model, issue, accessories, estimated_cost, status, created_at, updated_at
+           FROM tickets WHERE id = ?1 AND tenant_id = ?2 LIMIT 1`
+        ).bind(id, tenantId).first();
+        if (!ticket) return jsonResponse({ ok: false, error: "Ticket not found" }, 404, corsHeaders(request, env));
+
+        const events = await env.DB.prepare(
+          `SELECT id, status, note, created_at
+           FROM ticket_events WHERE ticket_id = ?1 AND tenant_id = ?2
+           ORDER BY datetime(created_at) ASC`
+        ).bind(id, tenantId).all();
+
+        return jsonResponse({ ok: true, ticket, events: events.results || [] }, 200, corsHeaders(request, env));
+      } catch {
+        return jsonResponse({ ok: false, error: "unauthorized" }, 401, corsHeaders(request, env));
+      }
+    }
+
+    if (path.startsWith("/api/tickets/") && method === "PUT" && !path.endsWith("/status")) {
+      try {
+        const tenantId = await getTenantIdFromRequest(request, env);
+        await ensureWorkshopSchema(env);
+        const id = path.split("/").pop() || "";
+        const payload = await readJson(request);
+        const existing = await env.DB.prepare("SELECT id FROM tickets WHERE id = ?1 AND tenant_id = ?2 LIMIT 1")
+          .bind(id, tenantId)
+          .first();
+        if (!existing) return jsonResponse({ ok: false, error: "Ticket not found" }, 404, corsHeaders(request, env));
+
+        await env.DB.prepare(
+          `UPDATE tickets
+           SET client_id = COALESCE(?3, client_id),
+               device_type = COALESCE(?4, device_type),
+               brand = COALESCE(?5, brand),
+               model = COALESCE(?6, model),
+               issue = COALESCE(?7, issue),
+               accessories = COALESCE(?8, accessories),
+               estimated_cost = COALESCE(?9, estimated_cost),
+               updated_at = datetime('now')
+           WHERE id = ?1 AND tenant_id = ?2`
+        )
+          .bind(
+            id,
+            tenantId,
+            payload.client_id ? String(payload.client_id) : null,
+            payload.device_type ? String(payload.device_type) : null,
+            payload.brand ? String(payload.brand) : null,
+            payload.model ? String(payload.model) : null,
+            payload.issue ? String(payload.issue) : null,
+            payload.accessories ? String(payload.accessories) : null,
+            payload.estimated_cost !== undefined ? Number(payload.estimated_cost) : null
+          )
+          .run();
+
+        const ticket = await env.DB.prepare(
+          `SELECT id, order_number, client_id, device_type, brand, model, issue, accessories, estimated_cost, status, created_at, updated_at
+           FROM tickets WHERE id = ?1 AND tenant_id = ?2 LIMIT 1`
+        ).bind(id, tenantId).first();
+
+        return jsonResponse({ ok: true, ticket }, 200, corsHeaders(request, env));
+      } catch {
+        return jsonResponse({ ok: false, error: "could not update ticket" }, 400, corsHeaders(request, env));
+      }
+    }
+
+    if (path.startsWith("/api/tickets/") && path.endsWith("/status") && method === "POST") {
+      try {
+        const tenantId = await getTenantIdFromRequest(request, env);
+        await ensureWorkshopSchema(env);
+        const payload = await readJson(request);
+        const nextStatus = String(payload.status || "").trim();
+        const note = payload.note ? String(payload.note) : null;
+        const parts = path.split("/");
+        const ticketId = parts[parts.length - 2] || "";
+        const ticket = await env.DB.prepare(
+          "SELECT id, status FROM tickets WHERE id = ?1 AND tenant_id = ?2 LIMIT 1"
+        ).bind(ticketId, tenantId).first();
+        if (!ticket) return jsonResponse({ ok: false, error: "Ticket not found" }, 404, corsHeaders(request, env));
+
+        const allowedStatus = ["received", "in_progress", "ready", "delivered", "cancelled"];
+        if (!allowedStatus.includes(nextStatus)) {
+          return jsonResponse({ ok: false, error: "Invalid status" }, 400, corsHeaders(request, env));
+        }
+
+        const currentStatus = String(ticket.status || "received");
+        if (currentStatus !== nextStatus && !isValidStatusTransition(currentStatus, nextStatus)) {
+          return jsonResponse({ ok: false, error: "Invalid status transition" }, 400, corsHeaders(request, env));
+        }
+
+        await env.DB.prepare(
+          "UPDATE tickets SET status = ?3, updated_at = datetime('now') WHERE id = ?1 AND tenant_id = ?2"
+        ).bind(ticketId, tenantId, nextStatus).run();
+
+        await env.DB.prepare(
+          "INSERT INTO ticket_events (id, tenant_id, ticket_id, status, note, created_at) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))"
+        ).bind(crypto.randomUUID(), tenantId, ticketId, nextStatus, note).run();
+
+        const updated = await env.DB.prepare(
+          `SELECT id, order_number, client_id, device_type, brand, model, issue, accessories, estimated_cost, status, created_at, updated_at
+           FROM tickets WHERE id = ?1 AND tenant_id = ?2 LIMIT 1`
+        ).bind(ticketId, tenantId).first();
+
+        return jsonResponse({ ok: true, ticket: updated }, 200, corsHeaders(request, env));
+      } catch {
+        return jsonResponse({ ok: false, error: "could not change status" }, 400, corsHeaders(request, env));
+      }
+    }
+
+    if (path === "/public/ticket-status" && method === "GET") {
+      try {
+        await ensureWorkshopSchema(env);
+        const order = String(url.searchParams.get("order") || "").trim();
+        if (!order) return jsonResponse({ ok: false, error: "order is required" }, 400, corsHeaders(request, env));
+
+        const ticket = await env.DB.prepare(
+          `SELECT order_number, status, updated_at
+           FROM tickets WHERE order_number = ?1 LIMIT 1`
+        ).bind(order).first();
+        if (!ticket) return jsonResponse({ ok: false, error: "Order not found" }, 404, corsHeaders(request, env));
+
+        const status = String(ticket.status || "received");
+        return jsonResponse(
+          {
+            ok: true,
+            order_number: String(ticket.order_number),
+            status,
+            updated_at: ticket.updated_at,
+            message: ticketStatusMessage(status)
+          },
+          200,
+          corsHeaders(request, env)
+        );
+      } catch {
+        return jsonResponse({ ok: false, error: "could not get status" }, 400, corsHeaders(request, env));
+      }
+    }
+
     if (path === "/api/admin/stats" && method === "GET") {
       try {
-        await getAuthContext(request, env);
-        const totalTickets = await safeCount(env, "reparaciones");
-        const openTickets = await safeCount(env, "reparaciones", "estado IS NULL OR lower(estado) NOT IN ('entregado','completado','completed','closed')");
-        const completedTickets = await safeCount(env, "reparaciones", "lower(estado) IN ('entregado','completado','completed','closed')");
-        const totalClients = await safeCount(env, "clientes");
-        const totalRevenue = await safeRevenue(env);
+        const tenantId = await getTenantIdFromRequest(request, env);
+        await ensureWorkshopSchema(env);
+        const totalTickets = await safeCount(env, "tickets", "tenant_id = ?1", [tenantId]);
+        const openTickets = await safeCount(env, "tickets", "tenant_id = ?1 AND status IN ('received','in_progress','ready')", [tenantId]);
+        const completedTickets = await safeCount(env, "tickets", "tenant_id = ?1 AND status = 'delivered'", [tenantId]);
+        const totalClients = await safeCount(env, "clients", "tenant_id = ?1", [tenantId]);
+        const revenue = await env.DB.prepare(
+          "SELECT COALESCE(SUM(estimated_cost), 0) as total FROM tickets WHERE tenant_id = ?1 AND status = 'delivered'"
+        ).bind(tenantId).first();
+        const totalRevenue = Number(revenue?.total || 0);
 
         return jsonResponse(
           {
@@ -1122,30 +1566,6 @@ export default {
         return withCors(jsonResponse({ ok: true }, 200), request, env);
       } catch {
         return withCors(jsonResponse({ ok: false, error: "bad_request" }, 400), request, env);
-      }
-    }
-
-    if (path === "/admin/dashboard" && method === "GET") {
-      try {
-        const authContext = await getAuthContext(request, env);
-        if (!isAdminUser(authContext.role, authContext.email, env)) {
-          return jsonResponse({ ok: false, error: "forbidden" }, 403, corsHeaders(request, env));
-        }
-        return jsonResponse(
-          {
-            ok: true,
-            dashboard: {
-              totalRepairs: 24,
-              openRepairs: 8,
-              completedToday: 5,
-              pendingOrders: 3
-            }
-          },
-          200,
-          corsHeaders(request, env)
-        );
-      } catch {
-        return jsonResponse({ ok: false, error: "unauthorized" }, 401, corsHeaders(request, env));
       }
     }
     if (path === "/admin/stats" && method === "GET") {
